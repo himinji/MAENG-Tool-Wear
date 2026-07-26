@@ -7,10 +7,11 @@
    중심으로 찾고, 그 가운데 각도 + 날끝 고립 경계 오프셋으로 판별 프레임 선정.
 2. **위상 정밀 정렬(마모공구)**: 스텝이 정확히 1°가 아니고 마모로 피크가
    들쭉날쭉해 phase-match 한 장이 최적이 아닐 수 있으므로, 마모공구 후보를
-   앞뒤 ±search장(기본 ±2, 총 5장) 모두 SAM 검출 → 날끝을 제외한 몸통 구간에서
-   새 공구 외곽선과 점별 반경차(|r_new - r_worn|)가 최소인 프레임을 정답 위상으로
-   선택. (판별 각도는 사인 곡선 경사 구간이라 프레임당 외곽선 변화가 마모보다
-   커서 위상을 가려낼 수 있음. 5장의 잔차·측정값을 표로 출력해 편향 확인 가능.)
+   앞뒤 ±search장(기본 ±2, 총 5장) 모두 SAM 검출 → 새 공구 외곽선과의
+   **y값 차이 RMSE가 최소인 프레임**을 정답 위상으로 선택.
+   - 각 x마다 외곽선 y가 위/아래 2개씩 있으므로 둘 다 사용
+   - 날끝(x가 가장 작은 쪽) --tip-skip px 구간은 제외 — 마모 때문에 새 공구와
+     매칭이 잘 안 되는 부위라 위상 판단을 흐림
 3. 각 사진에서 SAM 날 검출(sam_blade_detect.detect_blade, 날끝 복원 포함).
 4. 정렬/스케일: 몸통 실루엣 중심선 y로 상하 정렬, 몸통 높이비로 배율.
    µm/px = 직경 / 새 공구 레퍼런스 피크 y_diff.
@@ -133,6 +134,46 @@ def edge_profile(mask, tip, axis_y, side, length=1400):
     return np.array(us), np.array(rs, dtype=float)
 
 
+def outline_yy(mask, tip, axis_y, length=1400):
+    """각 x(코너 기준 u)에서 외곽선의 y 두 값(위/아래)을 축 기준으로 반환.
+
+    반환: u[], y_top[], y_bot[]  (모두 축 중심선 기준 상대 y, px)
+    """
+    h, w = mask.shape
+    us, tops, bots = [], [], []
+    for u in range(0, length):
+        x = tip[0] + u
+        if x >= w:
+            break
+        ys = np.flatnonzero(mask[:, x])
+        if len(ys) == 0:
+            continue
+        us.append(u)
+        tops.append(ys.min() - axis_y)
+        bots.append(ys.max() - axis_y)
+    return np.array(us), np.array(tops, dtype=float), np.array(bots, dtype=float)
+
+
+def outline_rmse(n, wn, s, tip_skip, um):
+    """새/마모 외곽선의 y값 차이 RMSE (µm). 날끝 구간(u < tip_skip)은 제외.
+
+    각 x마다 외곽선 y가 위/아래 2개씩 있으므로 둘 다 사용한다.
+    마모 쪽은 몸통 배율 s를 곱해 새 공구 좌표계로 맞춘 뒤 비교.
+    """
+    un, nt, nb = outline_yy(n["det"]["final"], n["tip"], n["axis"])
+    uw, wt, wb = outline_yy(wn["det"]["final"], wn["tip"], wn["axis"])
+    common = np.intersect1d(un, uw)
+    common = common[common >= tip_skip]
+    if len(common) < 50:
+        return float("inf"), 0
+    i_n = np.searchsorted(un, common)
+    i_w = np.searchsorted(uw, common)
+    d_top = nt[i_n] - wt[i_w] * s
+    d_bot = nb[i_n] - wb[i_w] * s
+    rmse_px = float(np.sqrt(np.mean(np.concatenate([d_top, d_bot]) ** 2)))
+    return rmse_px * um, len(common)
+
+
 def process_frame(folder, files, idx, predictor, thresh, side):
     """한 프레임 SAM 검출 + 기하/프로파일. 실패 시 None."""
     gray = imread_gray(Path(folder) / files[idx])
@@ -171,27 +212,16 @@ def align_profiles(n, wn):
     return {"s": s, "common": common, "rn": rn, "rw": rw, "u_lo": u_lo, "u_hi": u_hi}
 
 
-def match_and_wear(aln, um):
-    """정렬 결과에서 형상잔차(위상 선택용)와 후퇴 통계(측정)를 계산.
-
-    위상 선택 지표는 마모량과 독립이어야 한다:
-      - 마모  = 대체로 균일한 반경 후퇴 (Δr 의 offset 성분)
-      - 위상오차 = 프로파일 기울기/형상 불일치 (Δr 의 변동 성분)
-    따라서 Δr 에서 중앙값(=마모 오프셋)을 뺀 뒤의 산포를 형상잔차로 쓴다.
-    (그냥 mean|Δr| 을 쓰면 구간 내 Δr 이 전부 양수라 후퇴평균과 동일해져서
-     '마모가 가장 적게 나오는 프레임'을 고르는 편향이 생김 — 실측 확인됨.)
-
-    반환: (shape_resid_um, vb_max, vb_mean, retreat_um)
-    """
+def wear_stats(aln, um):
+    """정렬 결과에서 마모 후퇴 통계(µm)를 계산. 반환: (vb_max, vb_mean, retreat_um)"""
     common, rn, rw = aln["common"], aln["rn"], aln["rw"]
     u_lo, u_hi = aln["u_lo"], aln["u_hi"]
     zone = (common >= u_lo) & (common <= u_hi)
     retreat_um = (rn - rw) * um
     if not zone.any():
-        return float("inf"), float("nan"), float("nan"), retreat_um
+        return float("nan"), float("nan"), retreat_um
     d = retreat_um[zone]
-    shape_resid = float(np.mean(np.abs(d - np.median(d))))
-    return shape_resid, float(d.max()), float(d.mean()), retreat_um
+    return float(d.max()), float(d.mean()), retreat_um
 
 
 def save_candidate_views(out_dir, tag, n, wn, aln, d, resid, vbmean, vbmax, scale=0.35):
@@ -205,7 +235,7 @@ def save_candidate_views(out_dir, tag, n, wn, aln, d, resid, vbmean, vbmax, scal
     cdir.mkdir(parents=True, exist_ok=True)
     stem = Path(wn["file"]).stem
     l1 = f"off{d:+d}  {wn['file']}"
-    l2 = f"shape={resid:.1f}um  retreat mean/max={vbmean:.1f}/{vbmax:.1f}um"
+    l2 = f"RMSE={resid:.1f}um  retreat mean/max={vbmean:.1f}/{vbmax:.1f}um"
 
     ind = cv2.cvtColor(wn["gray"], cv2.COLOR_GRAY2BGR)
     cnts, _ = cv2.findContours(wn["det"]["final"].astype(np.uint8),
@@ -249,6 +279,9 @@ def main():
                     help="측정할 절삭날 쪽 (기본 bottom)")
     ap.add_argument("--search", type=int, default=2,
                     help="마모공구 위상 탐색 반경(프레임, 기본 2 = 총 5장)")
+    ap.add_argument("--tip-skip", type=int, default=300,
+                    help="RMSE 계산에서 제외할 날끝 구간 길이(px, 기본 300). "
+                         "날끝은 마모로 새 공구와 매칭이 잘 안 되므로 제외")
     ap.add_argument("--thresh", type=int, default=210)
     ap.add_argument("--out", default="wear_side_out")
     args = ap.parse_args()
@@ -304,7 +337,7 @@ def main():
 
         # ── 마모공구 위상 탐색: ±search장 후보를 몸통 정합잔차로 평가 ──
         print(f"  {tag}/worn 위상 탐색 (idx {wi} ±{args.search}):")
-        print(f"    {'off':>4} {'idx':>4} {'file':>13} {'형상잔차µm':>10} {'후퇴평균µm':>10} {'후퇴최대µm':>10}")
+        print(f"    {'off':>4} {'idx':>4} {'file':>13} {'RMSEµm':>10} {'후퇴평균µm':>10} {'후퇴최대µm':>10}")
         cands = []
         for d in range(-args.search, args.search + 1):
             wj = wi + d
@@ -317,11 +350,12 @@ def main():
             if aln is None:
                 print(f"    {d:>+4} {wj:>4} {wn['file']:>13}  정렬 실패")
                 continue
-            resid, vbmax, vbmean, _ = match_and_wear(aln, um)
-            cands.append({"d": d, "wn": wn, "aln": aln, "resid": resid,
-                          "vbmax": vbmax, "vbmean": vbmean})
-            print(f"    {d:>+4} {wj:>4} {wn['file']:>13} {resid:>10.1f} {vbmean:>10.1f} {vbmax:>10.1f}")
-            save_candidate_views(out_dir, tag, n, wn, aln, d, resid, vbmean, vbmax)
+            rmse, npts = outline_rmse(n, wn, aln["s"], args.tip_skip, um)
+            vbmax, vbmean, _ = wear_stats(aln, um)
+            cands.append({"d": d, "wn": wn, "aln": aln, "resid": rmse,
+                          "vbmax": vbmax, "vbmean": vbmean, "npts": npts})
+            print(f"    {d:>+4} {wj:>4} {wn['file']:>13} {rmse:>10.1f} {vbmean:>10.1f} {vbmax:>10.1f}")
+            save_candidate_views(out_dir, tag, n, wn, aln, d, rmse, vbmean, vbmax)
         if not cands:
             print(f"  [{tag}] 마모공구 후보 없음 — 건너뜀")
             continue
@@ -336,14 +370,14 @@ def main():
             warn.append(f"최소가 탐색 경계(off{best['d']:+d}) — --search 확대 필요")
         flag = ("  [주의: " + " / ".join(warn) + "]") if warn else ""
         print(f"  → 선택: off {best['d']:+d} ({best['wn']['file']}), "
-              f"형상잔차 {best['resid']:.1f}µm (2위와 +{sep:.1f}µm){flag}")
+              f"RMSE {best['resid']:.1f}µm (2위와 +{sep:.1f}µm){flag}")
 
         wn = best["wn"]
         aln = best["aln"]
         s = aln["s"]
         if abs(1 - s) > 0.02:
             print(f"  [경고] 몸통 높이비 {s:.4f} — 배율 차이 큼")
-        _, vb_max, vb_mean, retreat_um = match_and_wear(aln, um)
+        vb_max, vb_mean, retreat_um = wear_stats(aln, um)
         common, rn_i, rw_i = aln["common"], aln["rn"], aln["rw"]
         u_lo, u_hi = aln["u_lo"], aln["u_hi"]
         report.append((tag, n["file"], wn["file"], best["d"], vb_max, vb_mean, u_lo, u_hi))
@@ -353,7 +387,8 @@ def main():
         # ── 위상 탐색 결과 플롯 ──
         fig, axp = plt.subplots(figsize=(8, 5))
         ds = [c["d"] for c in cands]
-        axp.plot(ds, [c["resid"] for c in cands], "o-", color="#4477aa", label="형상잔차 (선택 지표, 마모 무관)")
+        axp.plot(ds, [c["resid"] for c in cands], "o-", color="#4477aa",
+                 label=f"외곽선 y차 RMSE (선택 지표, 날끝 {args.tip_skip}px 제외)")
         axp.plot(ds, [c["vbmean"] for c in cands], "s--", color="#ee7733", label="후퇴 평균 (측정)")
         axp.axvline(best["d"], color="#cc3311", lw=1.2, label=f"선택 off {best['d']:+d}")
         axp.set_xlabel("마모공구 프레임 오프셋 (frame)")
