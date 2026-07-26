@@ -1,0 +1,53 @@
+# Python Virtual Environment
+venv/
+
+# Python cache files
+__pycache__/
+*.pyc
+
+# macOS system files
+.DS_Store
+._*
+
+# VS Code settings folder
+.vscode/
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# 생성된 모델 및 결과 폴더 (선택 사항)
+best_model*.h5
+comparison_results/
+comparison_results_multiclass/
+
+# PyInstaller 빌드 산출물
+dist/
+build_pyi/
+build/
+*.manifest
+
+# 모니터링 GUI 설정 캐시
+monitor_gui_config.json
+
+# ── 밑면 마모 진단(SAM) 테스트/결과/실험 출력 — 절대 커밋·푸시 금지 ──
+# (주의: .gitignore 는 줄 끝 인라인 주석을 지원 안 함 → 주석은 반드시 별도 줄)
+# tool_wear_v2/code/_wear_out 등 진단 결과
+tool_wear_v2/code/_*/
+# 옛 실험 출력(_wear_out, _region_dev, _residual_out* 등)
+tool_wear_v2/_*/
+results_botface/
+results_Al/
+# SAM 모델 체크포인트 (대용량, 재다운로드 가능)
+tool_wear_v2/code/sam_models/
+tool_wear_v2/sam_models/
+# side ref-angle test outputs
+ref_angle_out*/
+sam_click_out*/
+sam_blade_out*/
+wear_side_out*/
+
+# 실험·derisk 스크립트 (레포 제외, 로컬 보관)
+tool_wear_v2/recovered/
+tool_wear_v2/poc_*.py
+tool_wear_v2/run_region_detect.py
+tool_wear_v2/bottom_align.py
