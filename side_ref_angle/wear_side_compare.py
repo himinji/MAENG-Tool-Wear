@@ -23,8 +23,9 @@
 python wear_side_compare.py --new-dir "...\Initial\옆" --worn-dir "...\Test44\Toolwear\옆"
     --new-csv ref_angle_out_v6\ref_angle_scores.csv
     --worn-csv ref_angle_out_test44\ref_angle_scores.csv
-    [--diam 8.0] [--swap] [--search 2] [--out wear_side_out]
---swap: 2날 180° 모호성 해소용 — 새/마모 프레임 짝을 반대로 묶음
+    [--diam 8.0] [--pairing auto] [--search 2] [--out wear_side_out]
+--pairing: 2날 180° 모호성 해소. auto(기본)=새×마모 4조합의 RMSE를 모두 재서
+           합이 작은 매칭을 자동 선택. direct/swap 으로 강제 지정 가능
 --search: 마모공구 위상 탐색 반경(프레임, 기본 2 = 앞뒤 ±2, 총 5장)
 """
 import argparse
@@ -274,7 +275,11 @@ def main():
     ap.add_argument("--new-csv", required=True)
     ap.add_argument("--worn-csv", required=True)
     ap.add_argument("--diam", type=float, default=8.0, help="공구 직경 mm (기본 8)")
-    ap.add_argument("--swap", action="store_true", help="새/마모 프레임 짝 반대로")
+    ap.add_argument("--pairing", choices=["auto", "direct", "swap"], default="auto",
+                    help="새/마모 2장씩의 짝 결정 (기본 auto: 두 매칭의 RMSE 합이 "
+                         "작은 쪽 자동 선택). direct=순서대로, swap=교차")
+    ap.add_argument("--swap", action="store_true",
+                    help="(구버전 호환) --pairing swap 과 동일")
     ap.add_argument("--side", choices=["bottom", "top"], default="bottom",
                     help="측정할 절삭날 쪽 (기본 bottom)")
     ap.add_argument("--search", type=int, default=2,
@@ -319,48 +324,88 @@ def main():
     um = args.diam * 1000.0 / sel["new"]["ref_ydiff"]
     print(f"스케일: {um:.3f} µm/px  (직경 {args.diam}mm / 새 공구 피크 y_diff {sel['new']['ref_ydiff']:.0f}px)")
 
-    worn_mids = sel["worn"]["mids"][::-1] if args.swap else sel["worn"]["mids"]
-    pairs = list(zip(sel["new"]["mids"], worn_mids))
     worn_files = sel["worn"]["files"]
-
     predictor = get_predictor()
     print("SAM 로드 완료")
 
-    report = []
-    for k, (ni, wi) in enumerate(pairs):
-        tag = f"pair{k + 1}"
+    # ── 새 공구 2장 검출 ──
+    news = []
+    for i, ni in enumerate(sel["new"]["mids"]):
         n = process_frame(args.new_dir, sel["new"]["files"], ni, predictor, args.thresh, args.side)
         if n is None:
-            print(f"  [{tag}] 새 공구 프레임 검출 실패 — 건너뜀")
-            continue
-        print(f"  {tag}/new: {n['file']}  날끝={n['tip']}  축y={n['axis']:.0f}  몸통H={n['body_h']:.0f}px")
+            sys.exit(f"새 공구 프레임 검출 실패: idx {ni}")
+        news.append(n)
+        print(f"  new[{i}]: {n['file']}  날끝={n['tip']}  축y={n['axis']:.0f}  몸통H={n['body_h']:.0f}px")
 
-        # ── 마모공구 위상 탐색: ±search장 후보를 몸통 정합잔차로 평가 ──
-        print(f"  {tag}/worn 위상 탐색 (idx {wi} ±{args.search}):")
-        print(f"    {'off':>4} {'idx':>4} {'file':>13} {'RMSEµm':>10} {'후퇴평균µm':>10} {'후퇴최대µm':>10}")
-        cands = []
+    # ── 마모 후보 검출 (mid별 ±search) — 매칭 평가에 재사용하므로 1회만 ──
+    worn_cands = []
+    for j, wmid in enumerate(sel["worn"]["mids"]):
+        lst = []
         for d in range(-args.search, args.search + 1):
-            wj = wi + d
+            wj = wmid + d
             if not (0 <= wj < len(worn_files)):
                 continue
             wn = process_frame(args.worn_dir, worn_files, wj, predictor, args.thresh, args.side)
-            if wn is None:
-                continue
-            aln = align_profiles(n, wn)
-            if aln is None:
-                print(f"    {d:>+4} {wj:>4} {wn['file']:>13}  정렬 실패")
-                continue
-            rmse, npts = outline_rmse(n, wn, aln["s"], args.tip_skip, um)
-            vbmax, vbmean, _ = wear_stats(aln, um)
-            cands.append({"d": d, "wn": wn, "aln": aln, "resid": rmse,
-                          "vbmax": vbmax, "vbmean": vbmean, "npts": npts})
-            print(f"    {d:>+4} {wj:>4} {wn['file']:>13} {rmse:>10.1f} {vbmean:>10.1f} {vbmax:>10.1f}")
-            save_candidate_views(out_dir, tag, n, wn, aln, d, rmse, vbmean, vbmax)
-        if not cands:
-            print(f"  [{tag}] 마모공구 후보 없음 — 건너뜀")
-            continue
+            if wn is not None:
+                lst.append({"d": d, "wn": wn})
+        worn_cands.append(lst)
+        print(f"  worn[{j}]: idx {wmid} ±{args.search} → 후보 {len(lst)}장 검출")
 
-        best = min(cands, key=lambda c: c["resid"])
+    # ── 4개 조합(새 i × 마모 j) 각각 위상 탐색해 최소 RMSE 구하기 ──
+    best_of = {}
+    for i, n in enumerate(news):
+        for j, lst in enumerate(worn_cands):
+            ev = []
+            for c in lst:
+                aln = align_profiles(n, c["wn"])
+                if aln is None:
+                    continue
+                rmse, _ = outline_rmse(n, c["wn"], aln["s"], args.tip_skip, um)
+                vbmax, vbmean, _ = wear_stats(aln, um)
+                ev.append({"d": c["d"], "wn": c["wn"], "aln": aln, "resid": rmse,
+                           "vbmax": vbmax, "vbmean": vbmean})
+            if ev:
+                best_of[(i, j)] = min(ev, key=lambda e: e["resid"])
+                best_of[(i, j)]["all"] = ev
+
+    if len(best_of) < 4:
+        sys.exit("매칭 평가 실패 — 일부 조합에서 후보를 얻지 못함")
+
+    # ── 매칭 결정: 두 조합의 RMSE 합 비교 ──
+    print("\n  매칭 RMSE 행렬 (행=새, 열=마모, 각 칸은 ±탐색 최소값 µm):")
+    print(f"    {'':>10} {'worn[0]':>10} {'worn[1]':>10}")
+    for i in range(2):
+        print(f"    {'new[' + str(i) + ']':>10} "
+              f"{best_of[(i, 0)]['resid']:>10.1f} {best_of[(i, 1)]['resid']:>10.1f}")
+    tot_direct = best_of[(0, 0)]["resid"] + best_of[(1, 1)]["resid"]
+    tot_swap = best_of[(0, 1)]["resid"] + best_of[(1, 0)]["resid"]
+    print(f"    direct(0-0,1-1) 합 = {tot_direct:.1f}µm   swap(0-1,1-0) 합 = {tot_swap:.1f}µm")
+
+    mode = "swap" if args.swap else args.pairing
+    if mode == "auto":
+        mode = "swap" if tot_swap < tot_direct else "direct"
+        margin = abs(tot_swap - tot_direct)
+        lo = min(tot_swap, tot_direct)
+        note = "" if margin > 0.3 * lo else "  [주의: 두 매칭 차이 작음 — 날 대응 불확실]"
+        print(f"    → 자동 선택: {mode} (차이 {margin:.1f}µm){note}")
+    else:
+        print(f"    → 지정: {mode}")
+    combos = [(0, 0), (1, 1)] if mode == "direct" else [(0, 1), (1, 0)]
+
+    report = []
+    for k, (i, j) in enumerate(combos):
+        tag = f"pair{k + 1}"
+        n = news[i]
+        best = best_of[(i, j)]
+        print(f"\n  {tag}: new[{i}] {n['file']}  ↔  worn[{j}] 후보")
+        print(f"    {'off':>4} {'file':>13} {'RMSEµm':>10} {'후퇴평균µm':>10} {'후퇴최대µm':>10}")
+        cands = sorted(best["all"], key=lambda e: e["d"])
+        for c in cands:
+            mark = " ←선택" if c["d"] == best["d"] else ""
+            print(f"    {c['d']:>+4} {c['wn']['file']:>13} {c['resid']:>10.1f} "
+                  f"{c['vbmean']:>10.1f} {c['vbmax']:>10.1f}{mark}")
+            save_candidate_views(out_dir, tag, n, c["wn"], c["aln"], c["d"],
+                                 c["resid"], c["vbmean"], c["vbmax"])
         resid_sorted = sorted(c["resid"] for c in cands)
         sep = (resid_sorted[1] - resid_sorted[0]) if len(resid_sorted) > 1 else float("inf")
         warn = []
@@ -393,7 +438,7 @@ def main():
         axp.axvline(best["d"], color="#cc3311", lw=1.2, label=f"선택 off {best['d']:+d}")
         axp.set_xlabel("마모공구 프레임 오프셋 (frame)")
         axp.set_ylabel("µm")
-        axp.set_title(f"{tag}: 마모공구 위상 탐색 (몸통 정합 최소 = 정답 위상)")
+        axp.set_title(f"{tag}: 마모공구 위상 탐색 (외곽선 y차 RMSE 최소 = 정답 위상)")
         axp.set_xticks(ds)
         axp.legend()
         axp.grid(alpha=0.3)
