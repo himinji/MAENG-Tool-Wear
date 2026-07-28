@@ -122,6 +122,55 @@ def body_axis(tool, w):
         float(np.median([b - t for t, b in zip(tops, bots)]))
 
 
+def _cross_scan(col, y_from, d, lvl, limit=400):
+    """y_from 에서 d 방향으로 훑어 lvl 을 지나는 첫 지점(서브픽셀)."""
+    for k in range(0, limit):
+        y1, y2 = y_from + d * k, y_from + d * (k + 1)
+        if not (0 <= y1 < len(col) and 0 <= y2 < len(col)):
+            return None
+        a, b = col[y1], col[y2]
+        if (a - lvl) * (b - lvl) <= 0 and a != b:
+            return y1 + d * (lvl - a) / (b - a)
+    return None
+
+
+def jig_height(gray, bright=250, min_area=20000):
+    """왼쪽 지그의 밝은 구멍 세로지름(px, 서브픽셀). 배율 기준용.
+
+    공구 몸통은 플루트 구간이라 회전 위상에 따라 실루엣 높이가 변해(같은 공구에서
+    1443 vs 1318px) 배율 기준으로 불안정하다. 지그는 고정물이라 세션 내
+    반복성이 0.03px 수준으로 훨씬 안정적이다.
+    찾지 못하면 None → 호출측에서 몸통 기준으로 폴백.
+    """
+    h, w = gray.shape
+    bw = (gray[:, :w // 3] > bright).astype(np.uint8)
+    n, _, stats, cent = cv2.connectedComponentsWithStats(bw, 8)
+    best = None
+    for i in range(1, n):
+        a = stats[i, cv2.CC_STAT_AREA]
+        top, hh = stats[i, cv2.CC_STAT_TOP], stats[i, cv2.CC_STAT_HEIGHT]
+        if a < min_area or top <= 1 or top + hh >= h - 1:   # 배경/잘린 구멍 제외
+            continue
+        if best is None or a > best[0]:
+            best = (a, int(round(cent[i][0])), int(round(cent[i][1])), top, hh)
+    if best is None:
+        return None
+    _, cx, cy, top, hh = best
+    hs = []
+    for x in range(max(cx - 60, 0), min(cx + 61, w), 10):
+        col = gray[:, x].astype(float)
+        vin = float(np.median(col[max(cy - hh // 4, 0):cy + hh // 4]))      # 구멍 내부(밝음)
+        vout = float(np.median(col[max(top - 80, 0):max(top - 20, 1)]))     # 지그 몸체(어두움)
+        if vin - vout < 40:
+            continue
+        lvl = (vin + vout) / 2
+        y1 = _cross_scan(col, cy, -1, lvl)
+        y2 = _cross_scan(col, cy, +1, lvl)
+        if y1 is not None and y2 is not None:
+            hs.append(y2 - y1)
+    return float(np.median(hs)) if len(hs) >= 5 else None
+
+
 def auto_click(tool, tip, axis_y, side="bottom"):
     """날끝 오른쪽 150~450px 대역에서 지정한 쪽(기본 아래) 웨지의 무게중심."""
     ys, xs = np.nonzero(tool)
@@ -287,23 +336,35 @@ def outline_yy(mask, tip, axis_y, length=None, gray=None):
     return np.array(us), np.array(tops, dtype=float), np.array(bots, dtype=float)
 
 
-def outline_rmse(n, wn, s, tip_skip, um):
-    """새/마모 외곽선의 y값 차이 RMSE (µm). 날끝 구간(u < tip_skip)은 제외.
+def outline_rmse(n, wn, s, tip_skip, um, u_max=None, edge="both"):
+    """새/마모 외곽선의 y값 차이 RMSE (µm).
 
+    구간: tip_skip <= u <= u_max
+      - 날끝(u < tip_skip)은 마모로 매칭이 흐려져 제외
+      - u_max 를 주면 그 뒤(절삭과 무관한 뒷부분)를 잘라내고 계산 →
+        마모가 실제로 일어나는 앞부분 형상만으로 위상을 고른다
     각 x마다 외곽선 y가 위/아래 2개씩 있으므로 둘 다 사용한다.
-    마모 쪽은 몸통 배율 s를 곱해 새 공구 좌표계로 맞춘 뒤 비교.
+    마모 쪽은 배율 s를 곱해 새 공구 좌표계로 맞춘 뒤 비교.
     """
     un, nt, nb = outline_yy(n["det"]["final"], n["tip"], n["axis"], gray=n["gray"])
     uw, wt, wb = outline_yy(wn["det"]["final"], wn["tip"], wn["axis"], gray=wn["gray"])
     common = np.intersect1d(un, uw)
     common = common[common >= tip_skip]
+    if u_max is not None:
+        common = common[common <= u_max]
     if len(common) < 50:
         return float("inf"), 0
     i_n = np.searchsorted(un, common)
     i_w = np.searchsorted(uw, common)
     d_top = nt[i_n] - wt[i_w] * s
     d_bot = nb[i_n] - wb[i_w] * s
-    rmse_px = float(np.sqrt(np.mean(np.concatenate([d_top, d_bot]) ** 2)))
+    if edge == "bottom":
+        d = d_bot
+    elif edge == "top":
+        d = d_top
+    else:
+        d = np.concatenate([d_top, d_bot])
+    rmse_px = float(np.sqrt(np.mean(d ** 2)))
     return rmse_px * um, len(common)
 
 
@@ -325,17 +386,32 @@ def process_frame(folder, files, idx, predictor, thresh, side):
     det["final"] = refine_mask(det["final"], det["tip"], sd, us, ys)
     r = np.abs(ys - axis_y)
     return {"gray": gray, "det": det, "tip": det["tip"], "axis": axis_y,
-            "body_h": body_h, "side": sd, "file": files[idx], "idx": idx,
-            "u": us, "r": r}
+            "body_h": body_h, "jig_h": jig_height(gray),
+            "side": sd, "file": files[idx], "idx": idx, "u": us, "r": r}
 
 
-def align_profiles(n, wn):
-    """새/마모 프로파일을 코너·축 정렬 + 몸통 배율 s로 공통 u에 맞춤.
+def scale_ratio(n, wn, ref="jig"):
+    """배율 s와 그 출처. 지그가 잡히면 지그, 아니면 공구 몸통으로 폴백."""
+    if ref == "jig" and n.get("jig_h") and wn.get("jig_h"):
+        return n["jig_h"] / wn["jig_h"], "지그"
+    return n["body_h"] / wn["body_h"], "몸통"
 
-    반환: dict(s, common, rn, rw, u_lo, u_hi) 또는 None.
+
+def crop_view(img, tip, axis, u_max_px, margin=120, half=900):
+    """날끝~u_max 구간만 잘라낸 보기용 이미지."""
+    h, w = img.shape[:2]
+    x0, x1 = max(int(tip[0] - margin), 0), min(int(tip[0] + u_max_px + margin), w)
+    y0, y1 = max(int(axis - half), 0), min(int(axis + half), h)
+    return img[y0:y1, x0:x1]
+
+
+def align_profiles(n, wn, scale_ref="jig", u_max=None):
+    """새/마모 프로파일을 코너·축 정렬 + 배율 s로 공통 u에 맞춤.
+
+    반환: dict(s, s_src, common, rn, rw, u_lo, u_hi) 또는 None.
     u_lo..u_hi = 날끝(코너 램프)과 마스크 끝을 제외한 몸통 구간.
     """
-    s = n["body_h"] / wn["body_h"]
+    s, s_src = scale_ratio(n, wn, scale_ref)
     common = np.intersect1d(n["u"], wn["u"])
     if len(common) < 50:
         return None
@@ -345,7 +421,10 @@ def align_profiles(n, wn):
     reach = np.flatnonzero(rn >= 0.9 * plateau)
     u_lo = int(common[reach[0]]) + 30 if len(reach) else 30
     u_hi = int(common.max()) - 100
-    return {"s": s, "common": common, "rn": rn, "rw": rw, "u_lo": u_lo, "u_hi": u_hi}
+    if u_max is not None:                      # 크롭: 측정 구간도 같은 범위로
+        u_hi = min(u_hi, int(u_max))
+    return {"s": s, "s_src": s_src, "common": common, "rn": rn, "rw": rw,
+            "u_lo": u_lo, "u_hi": u_hi}
 
 
 def wear_stats(aln, um):
@@ -419,9 +498,21 @@ def main():
                     help="측정할 절삭날 쪽 (기본 bottom)")
     ap.add_argument("--search", type=int, default=2,
                     help="마모공구 위상 탐색 반경(프레임, 기본 2 = 총 5장)")
+    ap.add_argument("--rmse-edge", choices=["bottom", "top", "both"], default="bottom",
+                    help="위상 선택 RMSE 를 어느 경계에서 계산할지 (기본 bottom). "
+                         "값이 아니라 선택지")
+    ap.add_argument("--adoc", type=float, default=2.0,
+                    help="축방향 절삭깊이 mm (기본 2.0). RMSE 계산 구간을 "
+                         "날끝~crop-factor×adoc 으로 제한하는 데 쓴다")
+    ap.add_argument("--crop-factor", type=float, default=2.0,
+                    help="RMSE 계산 범위 = adoc × 이 값 (기본 2.0 → 0~4mm). "
+                         "0 이면 제한 없음(전 구간)")
     ap.add_argument("--tip-skip", type=int, default=300,
                     help="RMSE 계산에서 제외할 날끝 구간 길이(px, 기본 300). "
                          "날끝은 마모로 새 공구와 매칭이 잘 안 되므로 제외")
+    ap.add_argument("--scale-ref", choices=["jig", "body"], default="jig",
+                    help="배율 기준 (기본 jig: 왼쪽 고정 지그 구멍 세로지름. "
+                         "body: 공구 몸통 실루엣 높이 — 플루트 구간이라 위상에 흔들림)")
     ap.add_argument("--thresh", type=int, default=210)
     ap.add_argument("--out", default="wear_side_out")
     args = ap.parse_args()
@@ -459,6 +550,16 @@ def main():
     um = args.diam * 1000.0 / sel["new"]["ref_ydiff"]
     print(f"스케일: {um:.3f} µm/px  (직경 {args.diam}mm / 새 공구 피크 y_diff {sel['new']['ref_ydiff']:.0f}px)")
 
+    # 위상 선택용 RMSE 계산 범위 — 날끝~crop_factor×adoc 으로 크롭
+    if args.crop_factor > 0:
+        u_max_rmse = args.crop_factor * args.adoc * 1000.0 / um
+        print(f"RMSE 구간: u={args.tip_skip}~{u_max_rmse:.0f}px "
+              f"= {args.tip_skip * um / 1000:.2f}~{args.crop_factor * args.adoc:.2f}mm "
+              f"(adoc {args.adoc}mm × {args.crop_factor:g}),  경계={args.rmse_edge}")
+    else:
+        u_max_rmse = None
+        print(f"RMSE 구간: u>={args.tip_skip}px 이후 전 구간 (크롭 없음)")
+
     worn_files = sel["worn"]["files"]
     predictor = get_predictor()
     print("SAM 로드 완료")
@@ -470,7 +571,9 @@ def main():
         if n is None:
             sys.exit(f"새 공구 프레임 검출 실패: idx {ni}")
         news.append(n)
-        print(f"  new[{i}]: {n['file']}  날끝={n['tip']}  축y={n['axis']:.0f}  몸통H={n['body_h']:.0f}px")
+        jh = f"{n['jig_h']:.2f}" if n.get("jig_h") else "없음"
+        print(f"  new[{i}]: {n['file']}  날끝={n['tip']}  축y={n['axis']:.0f}  "
+              f"몸통H={n['body_h']:.0f}px  지그H={jh}px")
 
     # ── 마모 후보 검출 (mid별 ±search) — 매칭 평가에 재사용하므로 1회만 ──
     worn_cands = []
@@ -492,10 +595,11 @@ def main():
         for j, lst in enumerate(worn_cands):
             ev = []
             for c in lst:
-                aln = align_profiles(n, c["wn"])
+                aln = align_profiles(n, c["wn"], args.scale_ref, u_max_rmse)
                 if aln is None:
                     continue
-                rmse, _ = outline_rmse(n, c["wn"], aln["s"], args.tip_skip, um)
+                rmse, _ = outline_rmse(n, c["wn"], aln["s"], args.tip_skip, um,
+                                       u_max_rmse, args.rmse_edge)
                 vbmax, vbmean, _ = wear_stats(aln, um)
                 ev.append({"d": c["d"], "wn": c["wn"], "aln": aln, "resid": rmse,
                            "vbmax": vbmax, "vbmean": vbmean})
@@ -555,8 +659,11 @@ def main():
         wn = best["wn"]
         aln = best["aln"]
         s = aln["s"]
+        s_body, _ = scale_ratio(n, wn, "body")
+        print(f"    배율 s={s:.5f} ({aln['s_src']} 기준)  |  몸통 기준이면 {s_body:.5f} "
+              f"→ 차이 {(s_body-s)*100:+.3f}% = 반경 705px 에서 {(s_body-s)*705*um:+.1f}µm")
         if abs(1 - s) > 0.02:
-            print(f"  [경고] 몸통 높이비 {s:.4f} — 배율 차이 큼")
+            print(f"  [경고] 배율비 {s:.4f} — 차이 큼")
         vb_max, vb_mean, retreat_um = wear_stats(aln, um)
         common, rn_i, rw_i = aln["common"], aln["rn"], aln["rw"]
         u_lo, u_hi = aln["u_lo"], aln["u_hi"]
@@ -609,9 +716,14 @@ def main():
                                        cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             cv2.drawContours(ind, cnts, -1, col, 3)
             cv2.circle(ind, dat["tip"], 20, (0, 255, 255), 3)
-            cv2.putText(ind, f"{tag} {role}: {dat['file']}", (60, 120),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.8, col, 4)
-            ind_s = cv2.resize(ind, None, fx=0.35, fy=0.35, interpolation=cv2.INTER_AREA)
+            if u_max_rmse:
+                ind = crop_view(ind, dat["tip"], dat["axis"], u_max_rmse)
+                sc = 0.6
+            else:
+                sc = 0.35
+            cv2.putText(ind, f"{tag} {role}: {dat['file']}", (20, ind.shape[0] - 25),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.6, col, 4)
+            ind_s = cv2.resize(ind, None, fx=sc, fy=sc, interpolation=cv2.INTER_AREA)
             cv2.imencode(".png", ind_s)[1].tofile(
                 str(out_dir / f"{tag}_{role}_{Path(dat['file']).stem}_outline.png"))
 
@@ -624,10 +736,16 @@ def main():
         for m, col in [(n["det"]["final"], (255, 120, 0)), (wm, (0, 0, 255))]:
             cnts, _ = cv2.findContours(m.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             cv2.drawContours(canvas, cnts, -1, col, 3)
-        _t = f"{tag} bg=new({n['file']}) blue=new red=worn(off{best['d']:+d})"
-        cv2.putText(canvas, _t, (60, 120), cv2.FONT_HERSHEY_SIMPLEX, 1.8, (0, 0, 0), 10)
-        cv2.putText(canvas, _t, (60, 120), cv2.FONT_HERSHEY_SIMPLEX, 1.8, (255, 255, 255), 4)
-        small = cv2.resize(canvas, None, fx=0.35, fy=0.35, interpolation=cv2.INTER_AREA)
+        if u_max_rmse:
+            canvas = crop_view(canvas, n["tip"], n["axis"], u_max_rmse)
+            sc = 0.6
+        else:
+            sc = 0.35
+        _t = f"{tag} blue=new({n['file']}) red=worn({wn['file']}, off{best['d']:+d})"
+        yy = canvas.shape[0] - 25
+        cv2.putText(canvas, _t, (20, yy), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 0, 0), 9)
+        cv2.putText(canvas, _t, (20, yy), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (255, 255, 255), 3)
+        small = cv2.resize(canvas, None, fx=sc, fy=sc, interpolation=cv2.INTER_AREA)
         cv2.imencode(".png", small)[1].tofile(str(out_dir / f"{tag}_overlay.png"))
 
     print("\n===== 요약 =====")
