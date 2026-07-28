@@ -498,9 +498,10 @@ def main():
                     help="측정할 절삭날 쪽 (기본 bottom)")
     ap.add_argument("--search", type=int, default=2,
                     help="마모공구 위상 탐색 반경(프레임, 기본 2 = 총 5장)")
-    ap.add_argument("--rmse-edge", choices=["bottom", "top", "both"], default="bottom",
-                    help="위상 선택 RMSE 를 어느 경계에서 계산할지 (기본 bottom). "
-                         "값이 아니라 선택지")
+    ap.add_argument("--rmse-edge", choices=["bottom", "top", "both"], default="both",
+                    help="위상 선택 RMSE 를 어느 경계에서 계산할지 (기본 both). "
+                         "bottom 만 쓰면 회전에 둔감해 판별 마진이 0.2~3.8µm 로 "
+                         "무너진다(실측) — both 권장")
     ap.add_argument("--adoc", type=float, default=2.0,
                     help="축방향 절삭깊이 mm (기본 2.0). RMSE 계산 구간을 "
                          "날끝~crop-factor×adoc 으로 제한하는 데 쓴다")
