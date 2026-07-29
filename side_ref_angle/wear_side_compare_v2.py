@@ -567,6 +567,22 @@ def save_candidate_views(out_dir, tag, n, wn, aln, d, resid, vbmean, vbmax, scal
         str(cdir / f"{tag}_off{d:+d}_{stem}_overlay.png"))
 
 
+def save_new_view(out_dir, tag, n, scale=0.35):
+    """후보 폴더에 새 공구 본인 사진 + 외곽선 1장 저장 (후보들과 나란히 비교용)."""
+    cdir = out_dir / f"{tag}_candidates"
+    cdir.mkdir(parents=True, exist_ok=True)
+    ind = cv2.cvtColor(n["gray"], cv2.COLOR_GRAY2BGR)
+    cnts, _ = cv2.findContours(n["det"]["final"].astype(np.uint8),
+                               cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    cv2.drawContours(ind, cnts, -1, (255, 120, 0), 3)
+    cv2.circle(ind, n["tip"], 20, (0, 255, 255), 3)
+    cv2.putText(ind, f"NEW  {n['file']}", (60, 110), cv2.FONT_HERSHEY_SIMPLEX,
+                1.6, (255, 120, 0), 4)
+    cv2.imencode(".png", cv2.resize(ind, None, fx=scale, fy=scale,
+                                    interpolation=cv2.INTER_AREA))[1].tofile(
+        str(cdir / f"{tag}_new_{Path(n['file']).stem}_outline.png"))
+
+
 def main():
     ap = argparse.ArgumentParser(description="옆날 새/마모 SAM 비교 마모 측정")
     ap.add_argument("--new-dir", required=True)
@@ -755,6 +771,7 @@ def main():
         print(f"\n  {tag}: new[{i}] {n['file']}  ↔  worn[{j}] 후보")
         print(f"    {'off':>4} {'file':>13} {'RMSEµm':>10} {'후퇴평균µm':>10} {'후퇴최대µm':>10}")
         cands = sorted(best["all"], key=lambda e: e["d"])
+        save_new_view(out_dir, tag, n)          # 후보 폴더에 새 공구 1장 추가
         for c in cands:
             mark = " ←선택" if c["d"] == best["d"] else ""
             print(f"    {c['d']:>+4} {c['wn']['file']:>13} {c['resid']:>10.1f} "
