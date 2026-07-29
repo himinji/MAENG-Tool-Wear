@@ -340,6 +340,13 @@ def edge_profile(mask, tip, axis_y, side, length=None):
     return np.array(us), np.array(rs, dtype=float)
 
 
+def _smooth(a, k=15):
+    """이동 평균(창 k열). 위 경계는 스냅이 안 붙어 정수 픽셀 계단이 남으므로
+    이웃 열을 평균해 양자화 노이즈를 평활한다."""
+    pad = k // 2
+    return np.convolve(np.pad(a, pad, mode="edge"), np.ones(k) / k, mode="valid")
+
+
 def outline_yy(mask, tip, axis_y, length=None, gray=None):
     """각 x(코너 기준 u)에서 외곽선의 y 두 값(위/아래)을 축 기준으로 반환.
 
@@ -740,6 +747,7 @@ def main():
     combos = [(0, 0), (1, 1)] if mode == "direct" else [(0, 1), (1, 0)]
 
     report = []
+    top_pairs = []                 # 위(top) 경계 후퇴 그림용 (두 pair 공통 축으로 루프 뒤 생성)
     for k, (i, j) in enumerate(combos):
         tag = f"pair{k + 1}"
         n = news[i]
@@ -778,6 +786,17 @@ def main():
         report.append((tag, n["file"], wn["file"], best["d"], vb_max, vb_mean, u_lo, u_hi))
         print(f"  {tag}: 후퇴 최대 {vb_max:.1f}µm / 평균 {vb_mean:.1f}µm "
               f"(u={u_lo}~{u_hi}px = {u_lo * um / 1000:.2f}~{u_hi * um / 1000:.2f}mm)")
+
+        # ── 위(top) 경계 후퇴 데이터 수집 ──
+        tun, tnt, _ = outline_yy(n["det"]["final"], n["tip"], n["axis"], gray=n["gray"])
+        tuw, twt, _ = outline_yy(wn["det"]["final"], wn["tip"], wn["axis"], gray=wn["gray"])
+        tc = np.intersect1d(tun, tuw)
+        tn_y = tnt[np.searchsorted(tun, tc)]
+        tw_y = twt[np.searchsorted(tuw, tc)] * s
+        top_raw = (tw_y - tn_y) * um
+        top_pairs.append({"tag": tag, "nf": n["file"], "wf": wn["file"], "u": tc,
+                          "tn": tn_y, "tw": tw_y, "raw": top_raw,
+                          "sm": _smooth(top_raw, 15)})
 
         # ── 위상 탐색 결과 플롯 ──
         fig, axp = plt.subplots(figsize=(8, 5))
@@ -862,11 +881,48 @@ def main():
         small = cv2.resize(canvas, None, fx=sc, fy=sc, interpolation=cv2.INTER_AREA)
         cv2.imencode(".png", small)[1].tofile(str(out_dir / f"{tag}_overlay.png"))
 
+    # ── 위(top) 경계 후퇴 그림 — 두 pair 공통 축, 표시 0~3mm, 잘림 없음 ──
+    if top_pairs:
+        x_show = 3.0
+        vis = [p["sm"][p["u"] * um / 1000 <= x_show] for p in top_pairs]
+        ylo = min(0.0, min(v.min() for v in vis)) - 5
+        yhi = max(v.max() for v in vis) * 1.08 + 5
+        prof = [np.concatenate([p["tn"], p["tw"]]) * um / 1000 for p in top_pairs]
+        p_hi = min(v.min() for v in prof) - 0.1
+        p_lo = max(v.max() for v in prof) + 0.1
+        for p in top_pairs:
+            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
+            x = p["u"] * um / 1000
+            ax1.plot(x, p["tn"] * um / 1000, "-", color="#4477aa", label=f"새 ({p['nf']})")
+            ax1.plot(x, p["tw"] * um / 1000, "-", color="#cc3311",
+                     label=f"마모 ({p['wf']}, s보정)")
+            ax1.set_xlim(-0.1, 4.15)
+            ax1.set_ylim(p_lo, p_hi)              # 그림 위 = 실제 위
+            ax1.set_xlabel("코너에서 축방향 거리 (mm)")
+            ax1.set_ylabel("위 경계 위치 (축 기준 mm, 그림 위=실제 위)")
+            ax1.set_title(f"{p['tag']}: 위(top) 경계 프로파일")
+            ax1.legend()
+            ax1.grid(alpha=0.3)
+            ax2.plot(x, p["raw"], "-", color="#cccccc", lw=0.8, label="원시")
+            ax2.plot(x, p["sm"], "-", color="#ee7733", lw=1.8, label="평활(이동평균 15열)")
+            ax2.axhline(0, color="gray", lw=0.8)
+            ax2.set_xlim(-0.05, x_show)
+            ax2.set_ylim(ylo, yhi)
+            ax2.set_xlabel("코너에서 축방향 거리 (mm)")
+            ax2.set_ylabel("위 경계 후퇴 (µm, +=마모가 더 아래)")
+            ax2.set_title(f"{p['tag']}: 위 경계 후퇴")
+            ax2.legend(loc="upper right")
+            ax2.grid(alpha=0.3)
+            fig.tight_layout()
+            fig.savefig(out_dir / f"{p['tag']}_top_retreat.png", dpi=120)
+            plt.close(fig)
+
     print("\n===== 요약 =====")
     for tag, nf, wf, d, vb_max, vb_mean, u_lo, u_hi in report:
         print(f"{tag}  새 {nf} vs 마모 {wf}(off{d:+d}):  후퇴 최대 {vb_max:.1f}µm, "
               f"평균 {vb_mean:.1f}µm  (구간 {u_lo * um / 1000:.2f}~{u_hi * um / 1000:.2f}mm)")
-    print(f"결과 저장: {out_dir}\\pair*_phasematch.png, pair*_retreat.png, pair*_overlay.png")
+    print(f"결과 저장: {out_dir}\\pair*_phasematch.png, pair*_retreat.png, "
+          f"pair*_top_retreat.png, pair*_overlay.png")
 
 
 if __name__ == "__main__":
