@@ -181,6 +181,39 @@ def auto_click(tool, tip, axis_y, side="bottom"):
     return (int(xs[sel].mean()), int(ys[sel].mean())), side
 
 
+def trim_pale_tip(gray, tool, tip, click, r=30, fill=0.8, march_max=60):
+    """연한 날끝 트림: 반지름 r 원을 날끝→클릭 방향으로 밀며,
+    원 안 실루엣 픽셀 중 '진한'(몸통·배경 50% 중간값 이하) 비율이
+    fill 이상이 되면 멈춘다. 통과하는 동안 원 안의 연한 픽셀을 제외.
+
+    반환 (제외마스크|None, 새 날끝). 날끝이 처음부터 진하면 (None, tip).
+    """
+    h, w = gray.shape
+    ys, xs = np.nonzero(tool)
+    band = (xs >= tip[0] + 150) & (xs <= tip[0] + 450)
+    body = float(np.median(gray[ys[band], xs[band]]))
+    bg = float(np.median(gray[:, max(tip[0] - 300, 0):max(tip[0] - 60, 1)]))
+    t_dark = (body + bg) / 2.0
+    dark = tool & (gray <= t_dark)
+    v = np.array([click[0] - tip[0], click[1] - tip[1]], float)
+    v /= np.linalg.norm(v)
+    yy, xx = np.ogrid[:h, :w]
+    removed = np.zeros((h, w), bool)
+    for t in range(0, march_max + 1):
+        cx, cy = tip[0] + t * v[0], tip[1] + t * v[1]
+        disk = (xx - cx) ** 2 + (yy - cy) ** 2 <= r * r
+        n_sil = int((disk & tool).sum())
+        if n_sil and (disk & dark).sum() / n_sil >= fill:
+            break
+        removed |= disk & tool & ~dark
+    if not removed.any():
+        return None, tip
+    kept = tool & ~removed
+    ky, kx = np.nonzero(kept)
+    x_min = int(kx.min())
+    return removed, (x_min, int(np.median(ky[kx <= x_min + 3])))
+
+
 def snap_edge(gray, mask, tip, side, u, contrast_min=25):
     """마스크 경계에서 출발해 밝기 50% 지점을 서브픽셀로 찾은 에지 y.
 
@@ -368,8 +401,18 @@ def outline_rmse(n, wn, s, tip_skip, um, u_max=None, edge="both"):
     return rmse_px * um, len(common)
 
 
-def process_frame(folder, files, idx, predictor, thresh, side):
-    """한 프레임 SAM 검출 + 기하/프로파일. 실패 시 None."""
+def process_frame(folder, files, idx, predictor, thresh, side, sam_win=None,
+                  tip_trim=False):
+    """한 프레임 SAM 검출 + 기하/프로파일. 실패 시 None.
+
+    sam_win: (x0, x1) 고정 크롭 좌표 — 새 공구 레퍼런스 날끝 기준
+    [ref_x−R/2, ref_x+R] 로 main 에서 한 번 정해 모든 사진에 동일 적용.
+    주어지면 SAM 을 전체 프레임 대신 이 창(세로는 그대로) 위에서 돌리고,
+    결과 마스크/날끝을 원본 좌표로 되돌린다. 축·몸통·지그 계산과
+    이후의 스냅·프로파일은 항상 원본 프레임에서 수행.
+    tip_trim: 연한 날끝 트림(trim_pale_tip). 날끝/클릭이 트림된
+    실루엣 기준으로 다시 잡히고, 최종 마스크에서도 트림 픽셀을 뺀다.
+    """
     gray = imread_gray(Path(folder) / files[idx])
     if gray is None:
         return None
@@ -377,7 +420,42 @@ def process_frame(folder, files, idx, predictor, thresh, side):
         tool, tip0 = tool_silhouette(gray, thresh)
         axis_y, body_h = body_axis(tool, gray.shape[1])
         click, sd = auto_click(tool, tip0, axis_y, side)
-        det = detect_blade(gray, click, predictor, thresh)
+        trim = None
+        if tip_trim:
+            trim, tip1 = trim_pale_tip(gray, tool, tip0, click)
+            if trim is not None:
+                print(f"    날끝 트림 {files[idx]}: {int(trim.sum())}px 제외, "
+                      f"날끝 {tip0} → {tip1}")
+                tool = tool & ~trim
+                tip0 = tip1
+                click, sd = auto_click(tool, tip0, axis_y, side)
+        if sam_win:
+            x0 = max(int(sam_win[0]), 0)
+            x1 = min(int(sam_win[1]), gray.shape[1])
+            crop = gray[:, x0:x1]
+            # 음성점은 크롭 좌표로 다시 잡는다: 기본값(w-150 등)은 크롭에선 날 위에 떨어짐.
+            # 배경 위 음성점은 힘이 없어 반대쪽 날까지 마스크가 번질 수 있으므로
+            # 반대쪽 웨지 무게중심(확실히 공구 위)을 음성점으로 쓴다.
+            opp, _ = auto_click(tool, tip0, axis_y,
+                                "top" if sd == "bottom" else "bottom")
+            negs = [(opp[0] - x0, opp[1]),                     # 반대쪽 날 위
+                    (max(40, tip0[0] - x0 - 300), click[1])]   # 날끝 왼쪽 배경
+            det = detect_blade(crop, (click[0] - x0, click[1]), predictor, thresh,
+                               negs=negs)
+            full = np.zeros(gray.shape, bool)
+            full[:, x0:x1] = det["final"]
+            det["final"] = full
+            det["tip"] = (det["tip"][0] + x0, det["tip"][1])
+            det["sam_crop"] = (x0, x1)
+        else:
+            det = detect_blade(gray, click, predictor, thresh)
+        if trim is not None:
+            # detect_blade 내부의 날끝 패치가 연한 픽셀을 되살리므로 다시 빼고,
+            # 날끝(u 원점)도 트림된 마스크 기준으로 재계산
+            det["final"] &= ~trim
+            fy, fx = np.nonzero(det["final"])
+            x_min = int(fx.min())
+            det["tip"] = (x_min, int(np.median(fy[fx <= x_min + 3])))
     except Exception as e:
         print(f"    [건너뜀] idx {idx} {files[idx]}: {e}")
         return None
@@ -496,8 +574,8 @@ def main():
                     help="(구버전 호환) --pairing swap 과 동일")
     ap.add_argument("--side", choices=["bottom", "top"], default="bottom",
                     help="측정할 절삭날 쪽 (기본 bottom)")
-    ap.add_argument("--search", type=int, default=2,
-                    help="마모공구 위상 탐색 반경(프레임, 기본 2 = 총 5장)")
+    ap.add_argument("--search", type=int, default=3,
+                    help="마모공구 위상 탐색 반경(프레임, 기본 3 = 총 7장)")
     ap.add_argument("--rmse-edge", choices=["bottom", "top", "both"], default="both",
                     help="위상 선택 RMSE 를 어느 경계에서 계산할지 (기본 both). "
                          "bottom 만 쓰면 회전에 둔감해 판별 마진이 0.2~3.8µm 로 "
@@ -515,6 +593,15 @@ def main():
                     help="배율 기준 (기본 jig: 왼쪽 고정 지그 구멍 세로지름. "
                          "body: 공구 몸통 실루엣 높이 — 플루트 구간이라 위상에 흔들림)")
     ap.add_argument("--thresh", type=int, default=210)
+    ap.add_argument("--tip-trim", action="store_true",
+                    help="연한 날끝 트림: 반지름 30px 원을 날끝→클릭 방향으로 밀며 "
+                         "원 안 실루엣의 진한(몸통·배경 50% 중간값 이하) 비율이 "
+                         "80% 미만인 동안 연한 픽셀을 제외 (기본 꺼짐)")
+    ap.add_argument("--sam-crop", choices=["on", "off"], default="on",
+                    help="SAM 을 고정 좌표 크롭 위에서 실행 (기본 on). "
+                         "창 = x∈[ref_x−R/2, ref_x+R] — ref_x는 새 공구 "
+                         "레퍼런스(피크 2장) 날끝 x, R=반경(피크 y_diff/2). "
+                         "모든 사진을 같은 좌표로 자름. 세로는 자르지 않음")
     ap.add_argument("--out", default="wear_side_out")
     args = ap.parse_args()
 
@@ -531,7 +618,8 @@ def main():
     for name, csv_path in [("new", args.new_csv), ("worn", args.worn_csv)]:
         y, files = load_scores(csv_path)
         p1, p2, ma, mb, ref = peaks_and_mids(y)
-        sel[name] = {"files": files, "valleys": [ma, mb], "ref_ydiff": ref}
+        sel[name] = {"files": files, "valleys": [ma, mb], "ref_ydiff": ref,
+                     "peaks": [int(round(p1)), int(round(p2))]}
         print(f"[{name}] 피크 중심 {p1:.1f}/{p2:.1f} (ref y_diff={ref:.0f})  계곡 idx {ma}, {mb}")
 
     offsets = {}
@@ -551,6 +639,23 @@ def main():
     um = args.diam * 1000.0 / sel["new"]["ref_ydiff"]
     print(f"스케일: {um:.3f} µm/px  (직경 {args.diam}mm / 새 공구 피크 y_diff {sel['new']['ref_ydiff']:.0f}px)")
 
+    # SAM 크롭 창(고정 좌표): 새 공구 레퍼런스(피크 2장)의 날끝 x 를 기준으로
+    # [ref_x−R/2, ref_x+R] 을 한 번 정하고, 모든 사진(새·마모)을 같은 좌표로 자른다.
+    # R = 새 공구 반경(px) = 피크 y_diff / 2.
+    sam_win = None
+    if args.sam_crop == "on":
+        R = int(round(sel["new"]["ref_ydiff"] / 2.0))
+        ref_tips = []
+        for pk in sel["new"]["peaks"]:
+            g = imread_gray(Path(args.new_dir) / sel["new"]["files"][pk])
+            _, tp = tool_silhouette(g, args.thresh)
+            ref_tips.append(tp[0])
+        ref_x = int(round(np.mean(ref_tips)))
+        sam_win = (max(ref_x - R // 2, 0), ref_x + R)
+        print(f"SAM 크롭(고정 좌표): 새 공구 레퍼런스 날끝 x={ref_x} "
+              f"(피크 2장 {ref_tips}) → x {sam_win[0]}~{sam_win[1]} "
+              f"(R={R}px, 세로는 전체 유지)")
+
     # 위상 선택용 RMSE 계산 범위 — 날끝~crop_factor×adoc 으로 크롭
     if args.crop_factor > 0:
         u_max_rmse = args.crop_factor * args.adoc * 1000.0 / um
@@ -568,7 +673,8 @@ def main():
     # ── 새 공구 2장 검출 ──
     news = []
     for i, ni in enumerate(sel["new"]["mids"]):
-        n = process_frame(args.new_dir, sel["new"]["files"], ni, predictor, args.thresh, args.side)
+        n = process_frame(args.new_dir, sel["new"]["files"], ni, predictor, args.thresh,
+                          args.side, sam_win, args.tip_trim)
         if n is None:
             sys.exit(f"새 공구 프레임 검출 실패: idx {ni}")
         news.append(n)
@@ -584,7 +690,8 @@ def main():
             wj = wmid + d
             if not (0 <= wj < len(worn_files)):
                 continue
-            wn = process_frame(args.worn_dir, worn_files, wj, predictor, args.thresh, args.side)
+            wn = process_frame(args.worn_dir, worn_files, wj, predictor, args.thresh,
+                               args.side, sam_win, args.tip_trim)
             if wn is not None:
                 lst.append({"d": d, "wn": wn})
         worn_cands.append(lst)
@@ -717,7 +824,10 @@ def main():
                                        cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             cv2.drawContours(ind, cnts, -1, col, 3)
             cv2.circle(ind, dat["tip"], 20, (0, 255, 255), 3)
-            if u_max_rmse:
+            if sam_win:                       # 결과 사진도 SAM 크롭 창 그대로
+                ind = ind[:, sam_win[0]:min(sam_win[1], ind.shape[1])]
+                sc = 0.6
+            elif u_max_rmse:
                 ind = crop_view(ind, dat["tip"], dat["axis"], u_max_rmse)
                 sc = 0.6
             else:
@@ -737,7 +847,10 @@ def main():
         for m, col in [(n["det"]["final"], (255, 120, 0)), (wm, (0, 0, 255))]:
             cnts, _ = cv2.findContours(m.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             cv2.drawContours(canvas, cnts, -1, col, 3)
-        if u_max_rmse:
+        if sam_win:                           # 결과 사진도 SAM 크롭 창 그대로
+            canvas = canvas[:, sam_win[0]:min(sam_win[1], canvas.shape[1])]
+            sc = 0.6
+        elif u_max_rmse:
             canvas = crop_view(canvas, n["tip"], n["axis"], u_max_rmse)
             sc = 0.6
         else:

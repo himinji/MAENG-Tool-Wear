@@ -89,8 +89,13 @@ def get_predictor(model="vit_h"):
     return mod.SamPredictor(sam)
 
 
-def detect_blade(gray, point=None, predictor=None, thresh=210, tip_radius=60):
-    """날 영역 검출. 반환: dict(final, base, tool, tip, points, labels)."""
+def detect_blade(gray, point=None, predictor=None, thresh=210, tip_radius=60,
+                 negs=None):
+    """날 영역 검출. 반환: dict(final, base, tool, tip, points, labels).
+
+    negs: 음성 프롬프트 좌표 리스트. None 이면 전체 프레임용 기본 3점.
+    (크롭 이미지에서는 기본 위치가 날 위에 떨어질 수 있어 호출측이 지정)
+    """
     if predictor is None:
         predictor = get_predictor()
     h, w = gray.shape
@@ -103,11 +108,13 @@ def detect_blade(gray, point=None, predictor=None, thresh=210, tip_radius=60):
         raise ValueError("클릭점이 날끝과 같음 — 다른 위치를 지정하세요")
     v /= n
     tip_in = (int(tip[0] + 60 * v[0]), int(tip[1] + 60 * v[1]))
-    negs = [(w - 150, cy), (int(w * 0.75), int(h * 0.2)), (max(50, tip[0] - 300), cy)]
+    if negs is None:
+        negs = [(w - 150, cy), (int(w * 0.75), int(h * 0.2)),
+                (max(50, tip[0] - 300), cy)]
 
     predictor.set_image(cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB))
-    pts = np.array([(cx, cy), tip_in] + negs)
-    lbl = np.array([1, 1, 0, 0, 0])
+    pts = np.array([(cx, cy), tip_in] + list(negs))
+    lbl = np.array([1, 1] + [0] * len(negs))
     masks, scores, logits = predictor.predict(point_coords=pts, point_labels=lbl,
                                               multimask_output=True)
     best = int(np.argmax(scores))
