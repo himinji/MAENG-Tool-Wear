@@ -16,6 +16,7 @@ import time
 import queue
 import threading
 import traceback
+import subprocess
 
 import tkinter as tk
 from tkinter import ttk, filedialog, scrolledtext, messagebox
@@ -35,6 +36,8 @@ CONFIG_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), 'monitor_gui_v5_config.json')
 
 REF_NAME = 'Initial'                               # 새 공구 폴더 이름
+SIDE_DIR = os.path.join(                           # 옆날 판별 스크립트 폴더
+    os.path.dirname(os.path.abspath(__file__)), 'side_ref_angle')
 
 
 def _has_face_images(folder):
@@ -63,6 +66,29 @@ def face_folder(test_folder):
     if _has_face_images(test_folder):
         return test_folder
     return b   # 못 찾음: 없는 '아래' 경로 반환 → 상위에서 isdir False 로 에러 안내
+
+
+def side_folder(test_folder):
+    """Test 폴더 → 그 안의 옆면 이미지 폴더.
+    'Toolwear/옆' → '옆' 순으로 찾고, 둘 다 없으면 폴더 자체에
+    이미지(img_*.png)가 있으면 그 폴더를 그대로 사용한다."""
+    a = os.path.join(test_folder, 'Toolwear', '옆')
+    if os.path.isdir(a):
+        return a
+    b = os.path.join(test_folder, '옆')
+    if os.path.isdir(b):
+        return b
+    if _has_face_images(test_folder):
+        return test_folder
+    return b
+
+
+def tool_name(folder):
+    """폴더의 공구 이름 ('옆'/'아래'/'Toolwear' 를 지정했으면 상위 이름)."""
+    b = os.path.basename(os.path.normpath(folder))
+    if b in ('옆', '아래', 'Toolwear'):
+        return tool_name(os.path.dirname(os.path.normpath(folder)))
+    return b or 'tool'
 
 
 def folder_signature(folder):
@@ -212,7 +238,7 @@ class MonitorApp:
         hl = tk.Frame(header, bg=self.NAVY); hl.pack(side='left', padx=22, pady=12)
         tk.Label(hl, text="공구 마모 진단", bg=self.NAVY, fg='white',
                  font=('Malgun Gothic', 17, 'bold')).pack(anchor='w')
-        tk.Label(hl, text="Tool Wear Diagnosis  ·  v3 (밑면 기하 · 정렬/후퇴 측정)",
+        tk.Label(hl, text="Tool Wear Diagnosis  ·  v3 (밑면 기하 · 옆날 판별 · 정렬/후퇴 측정)",
                  bg=self.NAVY, fg=self.NAVY_SUB, font=('Malgun Gothic', 9)).pack(anchor='w')
         self.status_lbl = tk.Label(header, text="●  대기 중", bg=self.NAVY, fg=self.NAVY_SUB,
                                    font=('Malgun Gothic', 10, 'bold'))
@@ -224,6 +250,9 @@ class MonitorApp:
         self.parent_var = tk.StringVar()
         self.diag_ref_var = tk.StringVar()       # 폴더 진단: 새 공구(기준) 폴더
         self.diag_target_var = tk.StringVar()    # 폴더 진단: 진단할(마모) 폴더
+        self.side_ref_var = tk.StringVar()       # 옆날 판별: 새 공구(기준) 폴더
+        self.side_target_var = tk.StringVar()    # 옆날 판별: 판별할(마모) 폴더
+        self.side_rescan_var = tk.BooleanVar(value=False)
         self.output_var = tk.StringVar(value=os.path.join(os.getcwd(), 'results_botface'))
         self.diam_var = tk.StringVar(value='8.0')
         self.stable_var = tk.StringVar(value='5')
@@ -268,6 +297,29 @@ class MonitorApp:
         db = ttk.Frame(tab_diag); db.pack(fill='x', pady=(12, 0))
         self.diag_btn = ttk.Button(db, text="▶  진단 시작", style='Accent.TButton', command=self._diagnose)
         self.diag_btn.pack(side='left')
+
+        # 탭 3: 옆날 판별 (옆면 회전 촬영 → SAM 크롭 · 날 후퇴 측정)
+        tab_side = ttk.Frame(nb, padding=(0, 12)); nb.add(tab_side, text='  옆날 판별  ')
+        s1b, s1 = self._card(tab_side, '설정'); s1b.pack(fill='x'); s1.columnconfigure(1, weight=1)
+        self._field_row(s1, 0, "새 공구(기준) 폴더", self.side_ref_var, self._pick_side_ref)
+        self._field_row(s1, 1, "판별할(마모) 폴더", self.side_target_var, self._pick_side_target)
+        self._field_row(s1, 2, "결과 폴더", self.output_var, self._pick_output)
+        self._diam_row(s1, 3)
+        tk.Checkbutton(s1, text="레퍼런스 각도 스캔 다시 하기 (평소엔 기존 스캔 재사용)",
+                       variable=self.side_rescan_var,
+                       bg=self.CARD, fg=self.TEXT, activebackground=self.CARD,
+                       activeforeground=self.TEXT, selectcolor='white',
+                       font=('Malgun Gothic', 10), highlightthickness=0, bd=0
+                       ).grid(row=4, column=1, sticky='w', pady=(2, 0))
+        ttk.Label(tab_side,
+                  text="• 각 폴더의 Toolwear/옆(옆면 1° 회전 촬영, img_*.png)을 사용합니다. 옆 폴더를 직접 지정해도 됩니다.\n"
+                       "• 처음 1회는 레퍼런스 각도 스캔(420장, 폴더당 수 분)이 자동 실행되고 이후 재사용됩니다.\n"
+                       "• SAM 날 검출 포함 전체 판별에 수 분이 걸립니다. 결과: 날 2개의 후퇴(µm) 그래프·겹침 사진.",
+                  style='Hint.TLabel', justify='left').pack(anchor='w', pady=(10, 0))
+        sb2 = ttk.Frame(tab_side); sb2.pack(fill='x', pady=(12, 0))
+        self.side_btn = ttk.Button(sb2, text="▶  옆날 판별 시작", style='Accent.TButton',
+                                   command=self._side_diagnose)
+        self.side_btn.pack(side='left')
 
         util = ttk.Frame(body); util.pack(fill='x', pady=(12, 0))
         ttk.Button(util, text="결과 폴더 열기", style='Ghost.TButton', command=self._open_output).pack(side='left')
@@ -329,6 +381,18 @@ class MonitorApp:
                                     initialdir=self.diag_target_var.get() or os.getcwd())
         if d:
             self.diag_target_var.set(d)
+
+    def _pick_side_ref(self):
+        d = filedialog.askdirectory(title="새 공구(기준) 폴더 선택 (Toolwear/옆 포함)",
+                                    initialdir=self.side_ref_var.get() or os.getcwd())
+        if d:
+            self.side_ref_var.set(d)
+
+    def _pick_side_target(self):
+        d = filedialog.askdirectory(title="판별할 폴더 선택 (Toolwear/옆 포함)",
+                                    initialdir=self.side_target_var.get() or os.getcwd())
+        if d:
+            self.side_target_var.set(d)
 
     def _pick_output(self):
         d = filedialog.askdirectory(title="결과 폴더 선택")
@@ -461,6 +525,37 @@ class MonitorApp:
         p = {'ref': ref, 'target': target, 'output': output, 'diam': diam}
         self._launch(self._oneshot, p, allow_stop=True, status="진단 중")
 
+    def _side_diagnose(self):
+        if self._busy():
+            return
+        ref = self.side_ref_var.get().strip()
+        target = self.side_target_var.get().strip()
+        output = self.output_var.get().strip()
+        if not os.path.isfile(os.path.join(SIDE_DIR, 'wear_side_compare_v2.py')):
+            messagebox.showerror("오류", f"옆날 판별 스크립트 폴더가 없습니다:\n{SIDE_DIR}")
+            return
+        if not ref or not os.path.isdir(side_folder(ref)):
+            messagebox.showerror("오류", f"새 공구(기준) 폴더에 옆면 이미지가 없습니다:\n{ref}\n"
+                                         "(Toolwear/옆 · 옆 하위폴더 또는 폴더 자체의 img_*.png)")
+            return
+        if not target or not os.path.isdir(side_folder(target)):
+            messagebox.showerror("오류", f"판별할 폴더에 옆면 이미지가 없습니다:\n{target}\n"
+                                         "(Toolwear/옆 · 옆 하위폴더 또는 폴더 자체의 img_*.png)")
+            return
+        if not output:
+            messagebox.showerror("오류", "결과 폴더를 지정하세요.")
+            return
+        try:
+            diam = float(self.diam_var.get())
+            if diam <= 0:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror("오류", "공구 직경(mm)은 양수여야 합니다.")
+            return
+        p = {'ref': ref, 'target': target, 'output': output, 'diam': diam,
+             'rescan': self.side_rescan_var.get()}
+        self._launch(self._side_oneshot, p, allow_stop=True, status="옆날 판별 중")
+
     def _busy(self):
         return self.worker is not None and self.worker.is_alive()
 
@@ -477,6 +572,7 @@ class MonitorApp:
         st = 'disabled' if busy else 'normal'
         self.start_btn.configure(state=st)
         self.diag_btn.configure(state=st)
+        self.side_btn.configure(state=st)
         self.stop_btn.configure(state='normal' if (busy and allow_stop) else 'disabled')
 
     def _stop(self):
@@ -549,6 +645,69 @@ class MonitorApp:
         except Exception:
             self.log(f"[{name}] 진단 중 오류:\n" + traceback.format_exc())
 
+    # ---------- 옆날 판별 ----------
+    def _run_script(self, args_list, cwd):
+        """side_ref_angle 스크립트를 서브프로세스로 실행, 출력을 로그로 스트리밍."""
+        env = {**os.environ, 'PYTHONUTF8': '1'}
+        proc = subprocess.Popen([sys.executable, '-u'] + args_list, cwd=cwd,
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                text=True, encoding='utf-8', errors='replace', env=env)
+        for line in proc.stdout:
+            self.log(line.rstrip('\n'))
+            if self.stop_event.is_set():
+                proc.terminate()
+                self.log(">>> 중지 요청 — 프로세스 종료")
+                break
+        proc.wait()
+        return proc.returncode
+
+    def _ensure_ref_scan(self, side_path, name, output, rescan):
+        """레퍼런스 각도 스캔 CSV 확보 (없거나 재스캔 요청 시 find_ref_angle 실행)."""
+        scan_dir = os.path.join(output, f'refscan_{name}')
+        csvp = os.path.join(scan_dir, 'ref_angle_scores.csv')
+        if os.path.isfile(csvp) and not rescan:
+            self.log(f"레퍼런스 스캔 재사용: {csvp}")
+            return csvp
+        self.log(f"\n>>> 레퍼런스 각도 스캔 ({name}): {side_path}")
+        rc = self._run_script([os.path.join(SIDE_DIR, 'find_ref_angle.py'),
+                               side_path, '--out', scan_dir], cwd=SIDE_DIR)
+        if rc != 0 or not os.path.isfile(csvp):
+            raise RuntimeError(f"레퍼런스 각도 스캔 실패 (종료 코드 {rc})")
+        return csvp
+
+    def _side_oneshot(self, p):
+        """옆날 판별: 레퍼런스 스캔(캐시) → wear_side_compare_v2 실행."""
+        name = tool_name(p['target'])
+        refname = tool_name(p['ref'])
+        try:
+            self.log("=" * 50)
+            self.log(f">>> 옆날 판별: {name}  (기준 = {refname})")
+            new_csv = self._ensure_ref_scan(side_folder(p['ref']),
+                                            f'{refname}_side', p['output'], p['rescan'])
+            if self.stop_event.is_set():
+                return
+            worn_csv = self._ensure_ref_scan(side_folder(p['target']),
+                                             f'{name}_side', p['output'], p['rescan'])
+            if self.stop_event.is_set():
+                return
+            out_dir = os.path.join(p['output'], f'side_{name}')
+            self.log(f"\n>>> 옆날 마모 측정 시작 (결과: {out_dir})")
+            rc = self._run_script([os.path.join(SIDE_DIR, 'wear_side_compare_v2.py'),
+                                   '--new-dir', side_folder(p['ref']),
+                                   '--worn-dir', side_folder(p['target']),
+                                   '--new-csv', new_csv, '--worn-csv', worn_csv,
+                                   '--diam', str(p['diam']), '--tip-skip', '210',
+                                   '--out', out_dir], cwd=SIDE_DIR)
+            if rc == 0:
+                self.log(f"\n[{name}] 옆날 판별 완료 ▶ 결과 폴더: {out_dir}")
+                gp = os.path.join(out_dir, 'pair1_retreat.png')
+                if os.path.isfile(gp):
+                    self.preview_queue.put(gp)
+            elif not self.stop_event.is_set():
+                self.log(f"[{name}] 옆날 판별 실패 (종료 코드 {rc})")
+        except Exception:
+            self.log(f"[{name}] 옆날 판별 중 오류:\n" + traceback.format_exc())
+
     def _monitor_loop(self, p):
         self._get_ref(p['ref'], p['diam'])
         processed = set()
@@ -589,6 +748,7 @@ class MonitorApp:
     def _save_config(self):
         cfg = {'parent': self.parent_var.get(),
                'diag_ref': self.diag_ref_var.get(), 'diag_target': self.diag_target_var.get(),
+               'side_ref': self.side_ref_var.get(), 'side_target': self.side_target_var.get(),
                'output': self.output_var.get(),
                'diam': self.diam_var.get(), 'stable': self.stable_var.get(),
                'process_existing': self.process_existing_var.get()}
@@ -609,6 +769,8 @@ class MonitorApp:
         self.parent_var.set(cfg.get('parent', ''))
         self.diag_ref_var.set(cfg.get('diag_ref', ''))
         self.diag_target_var.set(cfg.get('diag_target', ''))
+        self.side_ref_var.set(cfg.get('side_ref', ''))
+        self.side_target_var.set(cfg.get('side_target', ''))
         self.output_var.set(cfg.get('output', self.output_var.get()))
         self.diam_var.set(cfg.get('diam', '8.0'))
         self.stable_var.set(cfg.get('stable', '5'))
