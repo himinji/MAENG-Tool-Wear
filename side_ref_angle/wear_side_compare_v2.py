@@ -181,10 +181,19 @@ def auto_click(tool, tip, axis_y, side="bottom"):
     return (int(xs[sel].mean()), int(ys[sel].mean())), side
 
 
-def trim_pale_tip(gray, tool, tip, click, r=30, fill=0.8, march_max=60):
+def trim_pale_tip(gray, tool, tip, click, r=30, fill=0.8, march_max=60, level=0.32):
     """연한 날끝 트림: 반지름 r 원을 날끝→클릭 방향으로 밀며,
-    원 안 실루엣 픽셀 중 '진한'(몸통·배경 50% 중간값 이하) 비율이
-    fill 이상이 되면 멈춘다. 통과하는 동안 원 안의 연한 픽셀을 제외.
+    원 안 실루엣 픽셀 중 '진한' 비율이 fill 이상이 되면 멈춘다.
+    통과하는 동안 원 안의 연한 픽셀을 제외.
+
+    '진한' 기준 = 몸통 밝기에서 배경 쪽으로 level 만큼 간 지점.
+    level=0.5 면 밝기 50% 지점(스냅과 같은 규약)이지만 마모 날끝의 뿌연
+    영역이 거의 안 잘린다. 기본 0.32 는 새 공구가 전혀 안 잘리는 선에서
+    가장 많이 자르는 값(코팅 데이터 실측: 0.32→약 130, 새 0px / 마모 최대 1509px).
+
+    [주의] 이 방식은 픽셀을 직접 깎아내므로 많이 자를수록 경계가 울퉁불퉁해진다.
+    매끄러운 경계가 필요하면 연한 영역을 '음성 프롬프트'로 SAM 에 알려주는
+    쪽이 낫다 (기본 꺼짐인 이유).
 
     반환 (제외마스크|None, 새 날끝). 날끝이 처음부터 진하면 (None, tip).
     """
@@ -193,7 +202,7 @@ def trim_pale_tip(gray, tool, tip, click, r=30, fill=0.8, march_max=60):
     band = (xs >= tip[0] + 150) & (xs <= tip[0] + 450)
     body = float(np.median(gray[ys[band], xs[band]]))
     bg = float(np.median(gray[:, max(tip[0] - 300, 0):max(tip[0] - 60, 1)]))
-    t_dark = (body + bg) / 2.0
+    t_dark = body + level * (bg - body)
     dark = tool & (gray <= t_dark)
     v = np.array([click[0] - tip[0], click[1] - tip[1]], float)
     v /= np.linalg.norm(v)
@@ -347,6 +356,30 @@ def _smooth(a, k=15):
     return np.convolve(np.pad(a, pad, mode="edge"), np.ones(k) / k, mode="valid")
 
 
+def _contour_smooth(mask, w=41):
+    """마스크 외곽선을 원형 이동평균(창 w점)으로 평활해 다시 채움.
+
+    연한영역 게이트 마스크는 실루엣 교집합·열기 뒤에도 재료 윤곽의 잔물결이
+    남는데, 경계선 자체를 곡선으로 평활하면 손으로 그린 듯 매끄러워진다.
+    (통계 구간 반경 영향 0 실측)"""
+    cnts, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL,
+                               cv2.CHAIN_APPROX_NONE)
+    if not cnts:
+        return mask
+    c = max(cnts, key=cv2.contourArea).reshape(-1, 2).astype(np.float64)
+    if len(c) < w * 3:
+        return mask
+    kern = np.ones(w) / w
+    pad = w // 2
+    sm = np.empty_like(c)
+    for d in range(2):
+        ext = np.concatenate([c[-pad:, d], c[:, d], c[:pad, d]])   # 원형 패딩
+        sm[:, d] = np.convolve(ext, kern, mode="valid")[:len(c)]
+    out = np.zeros_like(mask, np.uint8)
+    cv2.fillPoly(out, [np.round(sm).astype(np.int32)], 1)
+    return out.astype(bool)
+
+
 def outline_yy(mask, tip, axis_y, length=None, gray=None):
     """각 x(코너 기준 u)에서 외곽선의 y 두 값(위/아래)을 축 기준으로 반환.
 
@@ -409,7 +442,7 @@ def outline_rmse(n, wn, s, tip_skip, um, u_max=None, edge="both"):
 
 
 def process_frame(folder, files, idx, predictor, thresh, side, sam_win=None,
-                  tip_trim=False):
+                  tip_trim=False, trim_level=0.32, pale_neg=True):
     """한 프레임 SAM 검출 + 기하/프로파일. 실패 시 None.
 
     sam_win: (x0, x1) 고정 크롭 좌표 — 새 공구 레퍼런스 날끝 기준
@@ -419,6 +452,8 @@ def process_frame(folder, files, idx, predictor, thresh, side, sam_win=None,
     이후의 스냅·프로파일은 항상 원본 프레임에서 수행.
     tip_trim: 연한 날끝 트림(trim_pale_tip). 날끝/클릭이 트림된
     실루엣 기준으로 다시 잡히고, 최종 마스크에서도 트림 픽셀을 뺀다.
+    pale_neg: 연한영역 게이트(A안). 날끝에서 이어진 연한 픽셀이 200개
+    이상인 프레임에서만 음성점 추가 + 날끝 패치 생략. 크롭 모드에서만 동작.
     """
     gray = imread_gray(Path(folder) / files[idx])
     if gray is None:
@@ -429,7 +464,7 @@ def process_frame(folder, files, idx, predictor, thresh, side, sam_win=None,
         click, sd = auto_click(tool, tip0, axis_y, side)
         trim = None
         if tip_trim:
-            trim, tip1 = trim_pale_tip(gray, tool, tip0, click)
+            trim, tip1 = trim_pale_tip(gray, tool, tip0, click, level=trim_level)
             if trim is not None:
                 print(f"    날끝 트림 {files[idx]}: {int(trim.sum())}px 제외, "
                       f"날끝 {tip0} → {tip1}")
@@ -447,10 +482,38 @@ def process_frame(folder, files, idx, predictor, thresh, side, sam_win=None,
                                 "top" if sd == "bottom" else "bottom")
             negs = [(opp[0] - x0, opp[1]),                     # 반대쪽 날 위
                     (max(40, tip0[0] - x0 - 300), click[1])]   # 날끝 왼쪽 배경
+            # 연한영역 게이트: 날끝에서 이어진 연한(뿌연) 픽셀이 200개 이상이면
+            # 그 무게중심에 음성점을 추가하고 날끝 패치를 생략(A안) →
+            # SAM 이 확실히 진한 재료만 매끄럽게 잡는다. 새 공구는 연한 픽셀이
+            # 없어 게이트가 안 열리므로 기존과 동일하게 동작.
+            pale_gate = False
+            if pale_neg:
+                prem, _ = trim_pale_tip(gray, tool, tip0, click)
+                if prem is not None and prem.sum() >= 200:
+                    pry, prx = np.nonzero(prem)
+                    negs.append((int(prx.mean()) - x0, int(pry.mean())))
+                    pale_gate = True
+                    print(f"    연한영역 게이트 {files[idx]}: {int(prem.sum())}px "
+                          f"→ 음성점 추가 + 날끝 패치 생략")
             det = detect_blade(crop, (click[0] - x0, click[1]), predictor, thresh,
                                negs=negs)
             full = np.zeros(gray.shape, bool)
-            full[:, x0:x1] = det["final"]
+            full[:, x0:x1] = det["base"] if pale_gate else det["final"]
+            if pale_gate:
+                # SAM 경계가 날끝 옆 밝은 반사 얼룩(밝기>=210, 실루엣 밖)을 물고
+                # 오는 것 제거 — 실루엣과 교집합해 재료 픽셀만 남긴다
+                full &= tool
+                # 교집합이 남기는 픽셀 톱니·얼룩 사이 가는 혀를 모폴로지 열기로
+                # 정리 → 진한 재료의 매끄러운 포락선만 남김 (27px: 주머니
+                # 아티팩트가 사라지는 최소 커널, 실측 통계 영향 0)
+                kern = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (27, 27))
+                full = cv2.morphologyEx(full.astype(np.uint8), cv2.MORPH_OPEN,
+                                        kern).astype(bool)
+                n_cc, cc_lab, cc_st, _ = cv2.connectedComponentsWithStats(
+                    full.astype(np.uint8), 8)
+                if n_cc > 2:                # 조각나면 최대 성분만 유지
+                    full = cc_lab == (1 + int(np.argmax(cc_st[1:, cv2.CC_STAT_AREA])))
+                full = _contour_smooth(full)   # 경계선 이동평균 → 잔물결 제거
             det["final"] = full
             det["tip"] = (det["tip"][0] + x0, det["tip"][1])
             det["sam_crop"] = (x0, x1)
@@ -618,8 +681,17 @@ def main():
     ap.add_argument("--thresh", type=int, default=210)
     ap.add_argument("--tip-trim", action="store_true",
                     help="연한 날끝 트림: 반지름 30px 원을 날끝→클릭 방향으로 밀며 "
-                         "원 안 실루엣의 진한(몸통·배경 50% 중간값 이하) 비율이 "
-                         "80% 미만인 동안 연한 픽셀을 제외 (기본 꺼짐)")
+                         "원 안 실루엣의 진한 비율이 80% 미만인 동안 연한 픽셀을 "
+                         "제외 (기본 꺼짐)")
+    ap.add_argument("--tip-trim-level", type=float, default=0.32,
+                    help="트림의 '진한' 기준 = 몸통에서 배경 쪽으로 이 비율만큼 간 "
+                         "밝기 (기본 0.32 ≈ 밝기 130). 값을 낮출수록 더 많이 잘리며, "
+                         "0.25 부근부터는 새 공구까지 잘리기 시작한다")
+    ap.add_argument("--pale-neg", choices=["on", "off"], default="on",
+                    help="연한영역 게이트 (기본 on): 날끝에서 이어진 연한 픽셀이 "
+                         "200개 이상인 프레임만 그 무게중심에 음성점을 추가하고 "
+                         "날끝 패치를 생략 → 확실히 진한 재료만 마스킹(A안). "
+                         "연한 픽셀이 없는 프레임(새 공구 등)은 영향 없음")
     ap.add_argument("--sam-crop", choices=["on", "off"], default="on",
                     help="SAM 을 고정 좌표 크롭 위에서 실행 (기본 on). "
                          "창 = x∈[ref_x−R/2, ref_x+R] — ref_x는 새 공구 "
@@ -697,7 +769,8 @@ def main():
     news = []
     for i, ni in enumerate(sel["new"]["mids"]):
         n = process_frame(args.new_dir, sel["new"]["files"], ni, predictor, args.thresh,
-                          args.side, sam_win, args.tip_trim)
+                          args.side, sam_win, args.tip_trim,
+                          pale_neg=(args.pale_neg == "on"))
         if n is None:
             sys.exit(f"새 공구 프레임 검출 실패: idx {ni}")
         news.append(n)
@@ -714,7 +787,8 @@ def main():
             if not (0 <= wj < len(worn_files)):
                 continue
             wn = process_frame(args.worn_dir, worn_files, wj, predictor, args.thresh,
-                               args.side, sam_win, args.tip_trim)
+                               args.side, sam_win, args.tip_trim,
+                               pale_neg=(args.pale_neg == "on"))
             if wn is not None:
                 lst.append({"d": d, "wn": wn})
         worn_cands.append(lst)
@@ -855,6 +929,15 @@ def main():
 
         # ── 개별 외곽선 ──
         for role, dat, col in [("new", n, (255, 120, 0)), ("worn", wn, (0, 0, 255))]:
+            # ── 외곽선 없는 크롭 원본 (선택 프레임 확인용) ──
+            plain = dat["gray"]
+            if sam_win:
+                plain = plain[:, sam_win[0]:min(sam_win[1], plain.shape[1])]
+            plain_s = cv2.resize(plain, None, fx=0.6, fy=0.6,
+                                 interpolation=cv2.INTER_AREA)
+            cv2.imencode(".png", plain_s)[1].tofile(
+                str(out_dir / f"{tag}_{role}_{Path(dat['file']).stem}_photo.png"))
+
             ind = cv2.cvtColor(dat["gray"], cv2.COLOR_GRAY2BGR)
             cnts, _ = cv2.findContours(dat["det"]["final"].astype(np.uint8),
                                        cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
