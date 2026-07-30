@@ -904,9 +904,17 @@ def main():
         tn_y = tnt[np.searchsorted(tun, tc)]
         tw_y = twt[np.searchsorted(tuw, tc)] * s
         top_raw = (tw_y - tn_y) * um
+        # 기준선 보정: ADOC 밖(u >= adoc)은 절삭이 닿지 않아 새/마모 위 경계가
+        # 일치해야 한다 → 그 구간(adoc~마스크끝 가드)의 차이 중앙값을 0으로
+        # 맞춰 정렬·배율 잔차(계통 오차)를 제거. 남는 것이 실제 마모 신호.
+        bz = (tc >= args.adoc * 1000.0 / um) & (tc <= u_hi)
+        top_bias = float(np.median(top_raw[bz])) if bz.any() else 0.0
+        top_adj = top_raw - top_bias
+        print(f"    위 경계 기준선 보정 {top_bias:+.1f}µm "
+              f"({args.adoc:.1f}~{u_hi * um / 1000:.2f}mm 구간 일치 기준)")
         top_pairs.append({"tag": tag, "nf": n["file"], "wf": wn["file"], "u": tc,
-                          "tn": tn_y, "tw": tw_y, "raw": top_raw,
-                          "sm": _smooth(top_raw, 15)})
+                          "tn": tn_y, "tw": tw_y, "raw": top_adj,
+                          "sm": _smooth(top_adj, 15), "bias": top_bias})
 
         # ── 위상 탐색 결과 플롯 ──
         fig, axp = plt.subplots(figsize=(8, 5))
@@ -1013,8 +1021,8 @@ def main():
             fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
             x = p["u"] * um / 1000
             ax1.plot(x, p["tn"] * um / 1000, "-", color="#4477aa", label=f"새 ({p['nf']})")
-            ax1.plot(x, p["tw"] * um / 1000, "-", color="#cc3311",
-                     label=f"마모 ({p['wf']}, s보정)")
+            ax1.plot(x, (p["tw"] * um - p["bias"]) / 1000, "-", color="#cc3311",
+                     label=f"마모 ({p['wf']}, s·기준선 보정)")
             ax1.set_xlim(-0.1, 4.15)
             ax1.set_ylim(p_lo, p_hi)              # 그림 위 = 실제 위
             ax1.set_xlabel("코너에서 축방향 거리 (mm)")
@@ -1029,7 +1037,7 @@ def main():
             ax2.set_ylim(ylo, yhi)
             ax2.set_xlabel("코너에서 축방향 거리 (mm)")
             ax2.set_ylabel("위 경계 후퇴 (µm, +=마모가 더 아래)")
-            ax2.set_title(f"{p['tag']}: 위 경계 후퇴")
+            ax2.set_title(f"{p['tag']}: 위 경계 후퇴  (기준선 보정 {p['bias']:+.1f}µm)")
             ax2.legend(loc="upper right")
             ax2.grid(alpha=0.3)
             fig.tight_layout()
