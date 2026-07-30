@@ -1,13 +1,20 @@
 # -*- coding: utf-8 -*-
 """
-공구 마모 진단 GUI ver3 (밑면 기하 방식)
+공구 마모 진단 GUI ver3 — 아랫날 · 옆날
 
-ver2(v4)와 차이:
-- 파이프라인: 세그멘테이션 CNN → **밑면 기하 방식**(botface_pipeline). 모델 파일 불필요.
-- 입력: 공구 세트 상위 폴더 하나 선택. 그 안에 Initial / Test1 / Test2 ... 가 생기고,
-        각 폴더의 `Toolwear/아래`(밑면)를 추적한다. Initial = 새 공구 기준.
-- 추가 입력: **공구 직경(mm)** → OD 기준으로 px→µm 환산.
-- 결과: (1) 회전 정렬한 두 실제 사진 나란히, (2) 두 날(짧은날/긴날) 크롭 비교 + 후퇴 프로파일 그래프.
+세그멘테이션 CNN 없이 기하 비교로 마모를 재는 진단 도구 (모델 파일 불필요).
+새 공구(Initial)를 기준으로 마모 공구의 날 후퇴량(µm)을 측정한다.
+
+탭 구성:
+1) 실시간 모니터링 — 공구 세트 상위 폴더를 감시, 새 Test 폴더가 생기면 아랫날 자동 진단
+2) 폴더 진단(아랫날) — 두 폴더의 `Toolwear/아래`를 직접 지정해 1회 진단 (botface_pipeline)
+                        결과: 회전 정렬 사진 + 두 날 크롭 비교 · 후퇴 프로파일 그래프
+3) 폴더 진단(옆날)  — 두 폴더의 `Toolwear/옆`(1° 회전 촬영)을 side_ref_angle 스크립트로
+                        진단. 레퍼런스 각도 스캔(캐시) → SAM 날 검출 → 날 후퇴 측정
+                        결과: 후퇴 그래프(아래·위 경계) · 겹침 · 외곽선 · 후보 이미지
+
+공통 입력: 공구 직경(mm) → px→µm 환산 기준.
+결과 폴더: <결과폴더>/<시각>_bottom_<공구>/ · <시각>_side_<공구>/ (재실행 시 누적)
 """
 import os
 import sys
@@ -147,7 +154,7 @@ class MonitorApp:
 
     def __init__(self, root):
         self.root = root
-        self.root.title("공구 마모 진단 v3 (밑면 기하)")
+        self.root.title("공구 마모 진단 v3 — 아랫날 · 옆날")
         self.root.geometry("920x980")
         self.root.minsize(900, 760)
         self.root.configure(bg=self.BG)
