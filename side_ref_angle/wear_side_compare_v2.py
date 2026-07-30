@@ -484,8 +484,9 @@ def process_frame(folder, files, idx, predictor, thresh, side, sam_win=None,
                     (max(40, tip0[0] - x0 - 300), click[1])]   # 날끝 왼쪽 배경
             # 연한영역 게이트: 날끝에서 이어진 연한(뿌연) 픽셀이 200개 이상이면
             # 그 무게중심에 음성점을 추가하고 날끝 패치를 생략(A안) →
-            # SAM 이 확실히 진한 재료만 매끄럽게 잡는다. 새 공구는 연한 픽셀이
-            # 없어 게이트가 안 열리므로 기존과 동일하게 동작.
+            # SAM 이 확실히 진한 재료만 매끄럽게 잡는다.
+            # 호출측에서 마모 공구에만 pale_neg=True 를 준다 — 새 공구는
+            # 항상 날끝까지 잡아야 하므로 게이트 대상이 아니다.
             pale_gate = False
             if pale_neg:
                 prem, _ = trim_pale_tip(gray, tool, tip0, click)
@@ -688,15 +689,20 @@ def main():
                          "밝기 (기본 0.32 ≈ 밝기 130). 값을 낮출수록 더 많이 잘리며, "
                          "0.25 부근부터는 새 공구까지 잘리기 시작한다")
     ap.add_argument("--pale-neg", choices=["on", "off"], default="on",
-                    help="연한영역 게이트 (기본 on): 날끝에서 이어진 연한 픽셀이 "
-                         "200개 이상인 프레임만 그 무게중심에 음성점을 추가하고 "
-                         "날끝 패치를 생략 → 확실히 진한 재료만 마스킹(A안). "
-                         "연한 픽셀이 없는 프레임(새 공구 등)은 영향 없음")
+                    help="연한영역 게이트 (기본 on, 마모 공구 프레임에만 적용): "
+                         "날끝에서 이어진 연한 픽셀이 200개 이상인 프레임만 그 "
+                         "무게중심에 음성점을 추가하고 날끝 패치를 생략 → 확실히 "
+                         "진한 재료만 마스킹(A안). 새 공구는 항상 날끝까지 잡음")
     ap.add_argument("--sam-crop", choices=["on", "off"], default="on",
                     help="SAM 을 고정 좌표 크롭 위에서 실행 (기본 on). "
                          "창 = x∈[ref_x−R/2, ref_x+R] — ref_x는 새 공구 "
                          "레퍼런스(피크 2장) 날끝 x, R=반경(피크 y_diff/2). "
                          "모든 사진을 같은 좌표로 자름. 세로는 자르지 않음")
+    ap.add_argument("--offset", default="20",
+                    help="계곡→판별 프레임 오프셋(장). 기본 20 고정 — 새 공구 판별 "
+                         "프레임이 모든 테스트에서 동일해진다(테스트 간 비교 가능). "
+                         "고립 경계+2 가 이를 넘는 계곡은 경고 출력. "
+                         "'auto' 면 옛 방식(4개 고립 경계 최대 + 2)")
     ap.add_argument("--out", default="wear_side_out")
     args = ap.parse_args()
 
@@ -721,10 +727,23 @@ def main():
     for name in sel:
         for v in sel[name]["valleys"]:
             offsets[(name, v)] = isolation_offset(dirs[name], sel[name]["files"], v, args.thresh)
-    common_off = max(offsets.values()) + 2
     for (name, v), k in offsets.items():
         print(f"  [{name}] 계곡 idx {v}: 고립 경계 +{k}장")
-    print(f"  → 공통 오프셋 +{common_off}장 적용")
+    if str(args.offset).strip().lower() == "auto":
+        # 옛 방식: 4개 고립 경계의 최댓값 + 2 — 마모 세트에 따라 새 공구
+        # 판별 프레임이 흔들려 테스트 간 직접 비교가 어렵다
+        common_off = max(offsets.values()) + 2
+        print(f"  → 공통 오프셋 +{common_off}장 적용 (auto: 최대 고립 경계 + 2)")
+    else:
+        # 고정 오프셋: 새 공구 판별 프레임이 모든 테스트에서 동일해짐.
+        # 고립 경계가 (오프셋-2)를 넘는 계곡은 반대날 겹침 위험 → 경고만.
+        common_off = int(args.offset)
+        print(f"  → 고정 오프셋 +{common_off}장 적용 (테스트 간 판별 프레임 동일)")
+        for (name, v), k in offsets.items():
+            if k + 2 > common_off:
+                print(f"  [경고] {name} 계곡 idx {v}: 고립 경계 +{k}장 — 고정 오프셋 "
+                      f"{common_off}로는 여유 {common_off - k}장 (반대날 겹침 위험). "
+                      f"--offset {k + 2} 이상 또는 --offset auto 권장")
     for name in sel:
         sel[name]["mids"] = [v + common_off for v in sel[name]["valleys"]]
         f = sel[name]["files"]
@@ -770,7 +789,7 @@ def main():
     for i, ni in enumerate(sel["new"]["mids"]):
         n = process_frame(args.new_dir, sel["new"]["files"], ni, predictor, args.thresh,
                           args.side, sam_win, args.tip_trim,
-                          pale_neg=(args.pale_neg == "on"))
+                          pale_neg=False)   # 새 공구는 게이트 없이 항상 날끝까지
         if n is None:
             sys.exit(f"새 공구 프레임 검출 실패: idx {ni}")
         news.append(n)
