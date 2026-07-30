@@ -383,7 +383,8 @@ def _contour_smooth(mask, w=41):
 def outline_yy(mask, tip, axis_y, length=None, gray=None):
     """각 x(코너 기준 u)에서 외곽선의 y 두 값(위/아래)을 축 기준으로 반환.
 
-    gray 를 주면 밝기 50% 지점으로 스냅(대비 있는 경계만). 반환은 축 기준 상대 y.
+    gray 를 주면 아래 경계만 밝기 50% 지점으로 스냅. 위 경계는 항상 마스크
+    경계 (내부 경계라 스냅 무의미 + 정반사 오검출 위험). 반환은 축 기준 상대 y.
     """
     h, w = mask.shape
     if length is None:
@@ -399,9 +400,12 @@ def outline_yy(mask, tip, axis_y, length=None, gray=None):
         if gray is None:
             yt, yb = float(ys.min()), float(ys.max())
         else:
-            yt = snap_edge(gray, mask, tip, "top", u)
+            # 스냅은 아래 경계만. 위 경계는 공구 내부 경계라 대비가 없어
+            # 스냅이 무의미하고, 대비가 생기는 유일한 경우가 반대날 정반사
+            # 광반(가짜 배경)이라 오검출 위험만 있음 → 항상 마스크 경계 사용.
+            yt = float(ys.min())
             yb = snap_edge(gray, mask, tip, "bottom", u)
-            if yt is None or yb is None:
+            if yb is None:
                 continue
         us.append(u)
         tops.append(yt - axis_y)
