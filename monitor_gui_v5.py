@@ -238,7 +238,7 @@ class MonitorApp:
         hl = tk.Frame(header, bg=self.NAVY); hl.pack(side='left', padx=22, pady=12)
         tk.Label(hl, text="공구 마모 진단", bg=self.NAVY, fg='white',
                  font=('Malgun Gothic', 17, 'bold')).pack(anchor='w')
-        tk.Label(hl, text="Tool Wear Diagnosis  ·  v3 (밑면 기하 · 옆날 판별 · 정렬/후퇴 측정)",
+        tk.Label(hl, text="Tool Wear Diagnosis  ·  v3 (아랫날 · 옆날 진단 · 정렬/후퇴 측정)",
                  bg=self.NAVY, fg=self.NAVY_SUB, font=('Malgun Gothic', 9)).pack(anchor='w')
         self.status_lbl = tk.Label(header, text="●  대기 중", bg=self.NAVY, fg=self.NAVY_SUB,
                                    font=('Malgun Gothic', 10, 'bold'))
@@ -284,7 +284,7 @@ class MonitorApp:
         self.stop_btn.pack(side='left', padx=(10, 0))
 
         # 탭 2: 폴더 진단 (직접 지정: 새 공구 폴더 + 진단할 폴더)
-        tab_diag = ttk.Frame(nb, padding=(0, 12)); nb.add(tab_diag, text='  폴더 진단  ')
+        tab_diag = ttk.Frame(nb, padding=(0, 12)); nb.add(tab_diag, text='  폴더 진단(아랫날)  ')
         d1b, d1 = self._card(tab_diag, '설정'); d1b.pack(fill='x'); d1.columnconfigure(1, weight=1)
         self._field_row(d1, 0, "새 공구(기준) 폴더", self.diag_ref_var, self._pick_diag_ref)
         self._field_row(d1, 1, "진단할 폴더", self.diag_target_var, self._pick_diag_target)
@@ -295,11 +295,11 @@ class MonitorApp:
                        "• 하위폴더가 없으면 지정한 폴더 안의 img_*.png 를 바로 진단합니다 (밑면 폴더를 직접 지정해도 됨).",
                   style='Hint.TLabel', justify='left').pack(anchor='w', pady=(10, 0))
         db = ttk.Frame(tab_diag); db.pack(fill='x', pady=(12, 0))
-        self.diag_btn = ttk.Button(db, text="▶  진단 시작", style='Accent.TButton', command=self._diagnose)
+        self.diag_btn = ttk.Button(db, text="▶  아랫날 진단 시작", style='Accent.TButton', command=self._diagnose)
         self.diag_btn.pack(side='left')
 
         # 탭 3: 옆날 판별 (옆면 회전 촬영 → SAM 크롭 · 날 후퇴 측정)
-        tab_side = ttk.Frame(nb, padding=(0, 12)); nb.add(tab_side, text='  옆날 판별  ')
+        tab_side = ttk.Frame(nb, padding=(0, 12)); nb.add(tab_side, text='  폴더 진단(옆날)  ')
         s1b, s1 = self._card(tab_side, '설정'); s1b.pack(fill='x'); s1.columnconfigure(1, weight=1)
         self._field_row(s1, 0, "새 공구(기준) 폴더", self.side_ref_var, self._pick_side_ref)
         self._field_row(s1, 1, "판별할(마모) 폴더", self.side_target_var, self._pick_side_target)
@@ -317,7 +317,7 @@ class MonitorApp:
                        "• SAM 날 검출 포함 전체 판별에 수 분이 걸립니다. 결과: 날 2개의 후퇴(µm) 그래프·겹침 사진.",
                   style='Hint.TLabel', justify='left').pack(anchor='w', pady=(10, 0))
         sb2 = ttk.Frame(tab_side); sb2.pack(fill='x', pady=(12, 0))
-        self.side_btn = ttk.Button(sb2, text="▶  옆날 판별 시작", style='Accent.TButton',
+        self.side_btn = ttk.Button(sb2, text="▶  옆날 진단 시작", style='Accent.TButton',
                                    command=self._side_diagnose)
         self.side_btn.pack(side='left')
 
@@ -597,6 +597,12 @@ class MonitorApp:
             self.root.after(0, self._worker_done)
 
     # ---------- 처리 ----------
+    @staticmethod
+    def _stamp(kind):
+        """결과 폴더 접두어: '<시각>_<kind>' → 폴더는 '<시각>_<kind>_<공구>'.
+        재실행마다 새 폴더가 생겨 결과가 누적된다(덮어쓰기 없음)."""
+        return f"{time.strftime('%Y%m%d_%H%M%S')}_{kind}"
+
     def _get_ref(self, ref_folder, diam):
         """Initial 축·스케일 캐시 (직경 바뀌면 재계산)."""
         if self._ref_cache is not None and self._ref_diam == diam:
@@ -616,7 +622,8 @@ class MonitorApp:
             self.log(f"\n>>> 처리: {name}")
             ref = self._get_ref(p['ref'], p['diam'])
             res = bp.process_tool(face_folder(p['ref']), face_folder(test_folder),
-                                  p['diam'], p['output'], name, ref_axis_scale=ref, log=self.log)
+                                  p['diam'], p['output'], name, ref_axis_scale=ref,
+                                  stamp=self._stamp('bottom'), log=self.log)
             recs = "  ".join(f"{b['name']}={b['recession_um']:.1f}µm" for b in res['blades'])
             self.log(f"[{name}] 완료 ▶ {recs}  (정렬 edge-NCC {res['zncc']:.3f})")
             gp = res['paths'].get('graph')
@@ -635,7 +642,8 @@ class MonitorApp:
             self.log("=" * 50)
             self.log(f">>> 진단: {name}  (기준 = {refname})")
             res = bp.process_tool(face_folder(p['ref']), face_folder(p['target']),
-                                  p['diam'], p['output'], name, ref_axis_scale=None, log=self.log)
+                                  p['diam'], p['output'], name, ref_axis_scale=None,
+                                  stamp=self._stamp('bottom'), log=self.log)
             recs = "  ".join(f"{b['name']}={b['recession_um']:.1f}µm" for b in res['blades'])
             self.log(f"[{name}] 완료 ▶ {recs}  (정렬 edge-NCC {res['zncc']:.3f})")
             gp = res['paths'].get('graph')
@@ -690,7 +698,7 @@ class MonitorApp:
                                              f'{name}_side', p['output'], p['rescan'])
             if self.stop_event.is_set():
                 return
-            out_dir = os.path.join(p['output'], f'side_{name}')
+            out_dir = os.path.join(p['output'], f"{self._stamp('side')}_{name}")
             self.log(f"\n>>> 옆날 마모 측정 시작 (결과: {out_dir})")
             rc = self._run_script([os.path.join(SIDE_DIR, 'wear_side_compare_v2.py'),
                                    '--new-dir', side_folder(p['ref']),
