@@ -677,17 +677,36 @@ class MonitorApp:
         return proc.returncode
 
     def _ensure_ref_scan(self, side_path, name, output, rescan):
-        """레퍼런스 각도 스캔 CSV 확보 (없거나 재스캔 요청 시 find_ref_angle 실행)."""
-        scan_dir = os.path.join(output, f'refscan_{name}')
+        """레퍼런스 각도 스캔 CSV 확보 (없거나 재스캔 요청 시 find_ref_angle 실행).
+
+        캐시 폴더명에 촬영 세션 폴더명을 포함하고, source.txt 로 원본 경로를
+        대조한다. 모든 세션의 새 공구 폴더가 'Initial' 이라서 이름만으로
+        캐시를 찾으면 다른 세션의 스캔을 집어 쓰는 사고가 나기 때문
+        (실제로 260709 캐시가 260728 ALUCUT 판별에 재사용됐던 버그의 수정).
+        """
+        src = os.path.normcase(os.path.abspath(side_path))
+        parts = [q for q in src.replace('\\', '/').split('/')
+                 if q and q.lower() not in ('옆', 'toolwear')]
+        session = parts[-2] if len(parts) >= 2 else 'root'   # .../<세션>/<공구>
+        scan_dir = os.path.join(output, f'refscan_{session}_{name}')
         csvp = os.path.join(scan_dir, 'ref_angle_scores.csv')
+        meta = os.path.join(scan_dir, 'source.txt')
         if os.path.isfile(csvp) and not rescan:
-            self.log(f"레퍼런스 스캔 재사용: {csvp}")
-            return csvp
+            try:
+                recorded = open(meta, encoding='utf-8').read().strip()
+            except OSError:
+                recorded = ''
+            if recorded == src:
+                self.log(f"레퍼런스 스캔 재사용: {csvp}")
+                return csvp
+            self.log(f"[주의] 캐시 원본 경로 불일치({recorded or '기록 없음'}) → 재스캔")
         self.log(f"\n>>> 레퍼런스 각도 스캔 ({name}): {side_path}")
         rc = self._run_script([os.path.join(SIDE_DIR, 'find_ref_angle.py'),
                                side_path, '--out', scan_dir], cwd=SIDE_DIR)
         if rc != 0 or not os.path.isfile(csvp):
             raise RuntimeError(f"레퍼런스 각도 스캔 실패 (종료 코드 {rc})")
+        with open(meta, 'w', encoding='utf-8') as f:
+            f.write(src)
         return csvp
 
     def _side_oneshot(self, p):
