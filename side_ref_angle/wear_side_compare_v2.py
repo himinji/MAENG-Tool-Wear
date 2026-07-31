@@ -558,11 +558,17 @@ def crop_view(img, tip, axis, u_max_px, margin=120, half=900):
     return img[y0:y1, x0:x1]
 
 
-def align_profiles(n, wn, scale_ref="jig", u_max=None):
+def align_profiles(n, wn, scale_ref="jig", adoc_px=None, tip_skip=210):
     """새/마모 프로파일을 코너·축 정렬 + 배율 s로 공통 u에 맞춤.
 
-    반환: dict(s, s_src, common, rn, rw, u_lo, u_hi) 또는 None.
-    u_lo..u_hi = 날끝(코너 램프)과 마스크 끝을 제외한 몸통 구간.
+    구간 설계 (마모는 절삭 구역 안에만 있다):
+      측정 구간   = [tip_skip, ADOC]        ← 마모가 실제로 생기는 곳
+      기준선 구간 = [ADOC, 마스크끝-100px]  ← 안 깎인 곳. 여기의 새/마모
+        반경 차이 중앙값(bias)은 정렬·배율의 계통 오차이므로 마모 곡선
+        전체에서 빼서 0 으로 맞춘다 (위 경계 기준선 보정과 같은 원리).
+
+    반환: dict(s, s_src, common, rn, rw, u_lo, u_hi, bias_px) 또는 None.
+    adoc_px 가 없으면 옛 방식(평탄부 90% 도달 규칙, 보정 없음)으로 동작.
     """
     s, s_src = scale_ratio(n, wn, scale_ref)
     common = np.intersect1d(n["u"], wn["u"])
@@ -570,14 +576,72 @@ def align_profiles(n, wn, scale_ref="jig", u_max=None):
         return None
     rn = n["r"][np.searchsorted(n["u"], common)]
     rw = wn["r"][np.searchsorted(wn["u"], common)] * s
-    plateau = float(np.median(rn[common >= common.max() - 400]))
-    reach = np.flatnonzero(rn >= 0.9 * plateau)
-    u_lo = int(common[reach[0]]) + 30 if len(reach) else 30
-    u_hi = int(common.max()) - 100
-    if u_max is not None:                      # 크롭: 측정 구간도 같은 범위로
-        u_hi = min(u_hi, int(u_max))
+    guard_end = int(common.max()) - 100
+    bias_px = 0.0
+    if adoc_px is not None:
+        u_lo = int(tip_skip)
+        u_hi = min(int(adoc_px), guard_end)
+        bz = (common >= adoc_px) & (common <= guard_end)
+        if bz.any():
+            bias_px = float(np.median((rn - rw)[bz]))
+            rw = rw + bias_px          # 기준선 구간의 차이를 0 으로
+    else:                              # 옛 방식 (호환용)
+        plateau = float(np.median(rn[common >= common.max() - 400]))
+        reach = np.flatnonzero(rn >= 0.9 * plateau)
+        u_lo = int(common[reach[0]]) + 30 if len(reach) else 30
+        u_hi = guard_end
     return {"s": s, "s_src": s_src, "common": common, "rn": rn, "rw": rw,
-            "u_lo": u_lo, "u_hi": u_hi}
+            "u_lo": u_lo, "u_hi": u_hi, "bias_px": bias_px,
+            "guard_end": guard_end}
+
+
+def top_retreat_align(n, wn, s, um, adoc_mm, base_lo_mm=2.5, base_hi_mm=3.9,
+                      dx_align=True, dx_max=25):
+    """절삭날(위 경계) 후퇴 계산 — 가로는 형상, 세로는 무절삭 구간 기준으로 정렬.
+
+    가로 dx: u 원점(날끝)이 두 사진에서 어긋나는 것을 보정. 아래 경계 형상이
+      가장 잘 겹치는 정수 이동을 base_lo~base_hi 구간에서 찾는다. 세로 오프셋을
+      뺀 뒤의 모양 불일치로 판정하므로 배율 잔차와 무관하다.
+    세로 영점: 위 경계의 [ADOC, 마스크끝-100px] 중앙값을 0으로 맞춘다. 절삭이
+      닿지 않은 구간이라 새/마모가 같아야 하고, 남는 차이는 정렬·배율의 계통
+      오차이기 때문. (아래 경계를 기준자로 삼는 방식도 시험했으나, 아래 경계
+      자체에 40µm 수준의 배율 잔차가 있어 그 오차가 위 경계로 옮겨왔다.)
+
+    반환 dict(u, tn, tw, raw, sm, dx, bias) 또는 None.
+    """
+    un, nt, nb = outline_yy(n["det"]["final"], n["tip"], n["axis"], gray=n["gray"])
+    uw, wt, wb = outline_yy(wn["det"]["final"], wn["tip"], wn["axis"], gray=wn["gray"])
+    wt, wb = wt * s, wb * s
+
+    dx = 0
+    if dx_align:
+        lo, hi = base_lo_mm * 1000.0 / um, base_hi_mm * 1000.0 / um
+        best = (np.inf, 0)
+        for k in range(-dx_max, dx_max + 1):
+            c = np.intersect1d(un, uw - k)
+            z = (c >= lo) & (c <= hi)
+            if z.sum() < 50:
+                continue
+            d = wb[np.searchsorted(uw - k, c[z])] - nb[np.searchsorted(un, c[z])]
+            resid = float(np.median(np.abs(d - np.median(d))))
+            if resid < best[0]:
+                best = (resid, k)
+        if np.isfinite(best[0]):
+            dx = best[1]
+
+    uw_s = uw - dx
+    c = np.intersect1d(un, uw_s)
+    if len(c) < 50:
+        return None
+    tn_y = nt[np.searchsorted(un, c)]
+    tw_y = wt[np.searchsorted(uw_s, c)]
+    raw = (tw_y - tn_y) * um
+    ge = int(c.max()) - 100                       # 마스크 끝 아티팩트 제외
+    bz = (c >= adoc_mm * 1000.0 / um) & (c <= ge)
+    bias = float(np.median(raw[bz])) if bz.any() else 0.0
+    raw = raw - bias
+    return {"u": c, "tn": tn_y, "tw": tw_y - bias / um, "raw": raw,
+            "sm": _smooth(raw, 15), "dx": dx, "bias": bias, "guard_end": ge}
 
 
 def wear_stats(aln, um):
@@ -672,8 +736,9 @@ def main():
                          "bottom 만 쓰면 회전에 둔감해 판별 마진이 0.2~3.8µm 로 "
                          "무너진다(실측) — both 권장")
     ap.add_argument("--adoc", type=float, default=2.0,
-                    help="축방향 절삭깊이 mm (기본 2.0). RMSE 계산 구간을 "
-                         "날끝~crop-factor×adoc 으로 제한하는 데 쓴다")
+                    help="축방향 절삭깊이 mm (기본 2.0). 마모 측정 구간=[tip-skip, "
+                         "adoc], 기준선(무절삭) 구간=[adoc, 마스크끝-100px]. "
+                         "위상 RMSE 구간 상한은 adoc×crop-factor")
     ap.add_argument("--crop-factor", type=float, default=2.0,
                     help="RMSE 계산 범위 = adoc × 이 값 (기본 2.0 → 0~4mm). "
                          "0 이면 제한 없음(전 구간)")
@@ -702,6 +767,15 @@ def main():
                          "창 = x∈[ref_x−R/2, ref_x+R] — ref_x는 새 공구 "
                          "레퍼런스(피크 2장) 날끝 x, R=반경(피크 y_diff/2). "
                          "모든 사진을 같은 좌표로 자름. 세로는 자르지 않음")
+    ap.add_argument("--dx-align", choices=["on", "off"], default="on",
+                    help="가로(dx) 정렬: 날끝 원점이 두 사진에서 어긋난 것을 "
+                         "아래 경계 형상 매칭으로 보정 (기본 on)")
+    ap.add_argument("--base-lo", type=float, default=2.5,
+                    help="가로 정렬용 형상 매칭 구간 시작 mm (기본 2.5). 날끝 "
+                         "램프가 안 섞이도록 충분히 뒤에서 시작한다")
+    ap.add_argument("--base-hi", type=float, default=3.9,
+                    help="가로 정렬용 형상 매칭 구간 끝 mm (기본 3.9). 마스크 끝 "
+                         "오차를 피하려고 크롭 끝(약 4.0mm)보다 앞에서 자른다")
     ap.add_argument("--offset", default="20",
                     help="계곡→판별 프레임 오프셋(장). 기본 20 고정 — 새 공구 판별 "
                          "프레임이 모든 테스트에서 동일해진다(테스트 간 비교 가능). "
@@ -823,7 +897,9 @@ def main():
         for j, lst in enumerate(worn_cands):
             ev = []
             for c in lst:
-                aln = align_profiles(n, c["wn"], args.scale_ref, u_max_rmse)
+                aln = align_profiles(n, c["wn"], args.scale_ref,
+                                     adoc_px=args.adoc * 1000.0 / um,
+                                     tip_skip=args.tip_skip)
                 if aln is None:
                     continue
                 rmse, _ = outline_rmse(n, c["wn"], aln["s"], args.tip_skip, um,
@@ -860,6 +936,7 @@ def main():
     combos = [(0, 0), (1, 1)] if mode == "direct" else [(0, 1), (1, 0)]
 
     report = []
+    top_report = []                # 절삭날(위 경계) 후퇴 요약 — 최종 결과
     top_pairs = []                 # 위(top) 경계 후퇴 그림용 (두 pair 공통 축으로 루프 뒤 생성)
     for k, (i, j) in enumerate(combos):
         tag = f"pair{k + 1}"
@@ -899,26 +976,28 @@ def main():
         u_lo, u_hi = aln["u_lo"], aln["u_hi"]
         report.append((tag, n["file"], wn["file"], best["d"], vb_max, vb_mean, u_lo, u_hi))
         print(f"  {tag}: 후퇴 최대 {vb_max:.1f}µm / 평균 {vb_mean:.1f}µm "
-              f"(u={u_lo}~{u_hi}px = {u_lo * um / 1000:.2f}~{u_hi * um / 1000:.2f}mm)")
+              f"(u={u_lo}~{u_hi}px = {u_lo * um / 1000:.2f}~{u_hi * um / 1000:.2f}mm, "
+              f"아래 기준선 보정 {aln['bias_px'] * um:+.1f}µm)")
 
-        # ── 위(top) 경계 후퇴 데이터 수집 ──
-        tun, tnt, _ = outline_yy(n["det"]["final"], n["tip"], n["axis"], gray=n["gray"])
-        tuw, twt, _ = outline_yy(wn["det"]["final"], wn["tip"], wn["axis"], gray=wn["gray"])
-        tc = np.intersect1d(tun, tuw)
-        tn_y = tnt[np.searchsorted(tun, tc)]
-        tw_y = twt[np.searchsorted(tuw, tc)] * s
-        top_raw = (tw_y - tn_y) * um
-        # 기준선 보정: ADOC 밖(u >= adoc)은 절삭이 닿지 않아 새/마모 위 경계가
-        # 일치해야 한다 → 그 구간(adoc~마스크끝 가드)의 차이 중앙값을 0으로
-        # 맞춰 정렬·배율 잔차(계통 오차)를 제거. 남는 것이 실제 마모 신호.
-        bz = (tc >= args.adoc * 1000.0 / um) & (tc <= u_hi)
-        top_bias = float(np.median(top_raw[bz])) if bz.any() else 0.0
-        top_adj = top_raw - top_bias
-        print(f"    위 경계 기준선 보정 {top_bias:+.1f}µm "
-              f"({args.adoc:.1f}~{u_hi * um / 1000:.2f}mm 구간 일치 기준)")
-        top_pairs.append({"tag": tag, "nf": n["file"], "wf": wn["file"], "u": tc,
-                          "tn": tn_y, "tw": tw_y, "raw": top_adj,
-                          "sm": _smooth(top_adj, 15), "bias": top_bias})
+        # ── 절삭날(위 경계) 후퇴 — 가로 dx 정렬 + 무절삭 구간 영점 ──
+        ta = top_retreat_align(n, wn, s, um, args.adoc, args.base_lo, args.base_hi,
+                               dx_align=(args.dx_align == "on"))
+        if ta is None:
+            print("    [경고] 절삭날 정렬 실패 — 공통 구간 데이터 부족")
+        else:
+            tz = ta["u"] <= args.adoc * 1000.0 / um       # 절삭 구간 0~ADOC
+            tmax = float(ta["sm"][tz].max()) if tz.any() else float("nan")
+            tmean = float(ta["sm"][tz].mean()) if tz.any() else float("nan")
+            print(f"    절삭날 후퇴: 최대 {tmax:.1f}µm / 평균 {tmean:.1f}µm "
+                  f"(0~{args.adoc:.2f}mm, 날끝 포함)")
+            print(f"      정렬: 가로 {ta['dx']:+d}px (아래 경계 형상, "
+                  f"{args.base_lo}~{args.base_hi}mm), 세로 영점 {ta['bias']:+.1f}µm "
+                  f"(위 경계 {args.adoc:.2f}~{ta['guard_end'] * um / 1000:.2f}mm)")
+            top_pairs.append({"tag": tag, "nf": n["file"], "wf": wn["file"],
+                              "u": ta["u"], "tn": ta["tn"], "tw": ta["tw"],
+                              "raw": ta["raw"], "sm": ta["sm"], "bias": ta["bias"],
+                              "dx": ta["dx"], "tmax": tmax, "tmean": tmean})
+            top_report.append((tag, n["file"], wn["file"], tmax, tmean))
 
         # ── 위상 탐색 결과 플롯 ──
         fig, axp = plt.subplots(figsize=(8, 5))
@@ -1025,13 +1104,13 @@ def main():
             fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
             x = p["u"] * um / 1000
             ax1.plot(x, p["tn"] * um / 1000, "-", color="#4477aa", label=f"새 ({p['nf']})")
-            ax1.plot(x, (p["tw"] * um - p["bias"]) / 1000, "-", color="#cc3311",
-                     label=f"마모 ({p['wf']}, s·기준선 보정)")
+            ax1.plot(x, p["tw"] * um / 1000, "-", color="#cc3311",
+                     label=f"마모 ({p['wf']}, dx·영점 정렬)")
             ax1.set_xlim(-0.1, 4.15)
             ax1.set_ylim(p_lo, p_hi)              # 그림 위 = 실제 위
             ax1.set_xlabel("코너에서 축방향 거리 (mm)")
             ax1.set_ylabel("위 경계 위치 (축 기준 mm, 그림 위=실제 위)")
-            ax1.set_title(f"{p['tag']}: 위(top) 경계 프로파일")
+            ax1.set_title(f"{p['tag']}: 절삭날(위 경계) 프로파일")
             ax1.legend()
             ax1.grid(alpha=0.3)
             ax2.plot(x, p["raw"], "-", color="#cccccc", lw=0.8, label="원시")
@@ -1040,18 +1119,24 @@ def main():
             ax2.set_xlim(-0.05, x_show)
             ax2.set_ylim(ylo, yhi)
             ax2.set_xlabel("코너에서 축방향 거리 (mm)")
-            ax2.set_ylabel("위 경계 후퇴 (µm, +=마모가 더 아래)")
-            ax2.set_title(f"{p['tag']}: 위 경계 후퇴  (기준선 보정 {p['bias']:+.1f}µm)")
+            ax2.axvspan(0, args.adoc, color="#44aa77", alpha=0.10, label="절삭 구간")
+            ax2.set_ylabel("절삭날 후퇴 (µm, +=마모)")
+            ax2.set_title(f"{p['tag']}: 절삭날 후퇴  최대 {p['tmax']:.1f} / 평균 "
+                          f"{p['tmean']:.1f}µm  (영점 {p['bias']:+.1f}µm, dx{p['dx']:+d}px)")
             ax2.legend(loc="upper right")
             ax2.grid(alpha=0.3)
             fig.tight_layout()
             fig.savefig(out_dir / f"{p['tag']}_top_retreat.png", dpi=120)
             plt.close(fig)
 
-    print("\n===== 요약 =====")
+    print("\n===== 요약 (절삭날 마모) =====")
+    for tag, nf, wf, tmax, tmean in top_report:
+        print(f"{tag}  새 {nf} vs 마모 {wf}:  절삭날 후퇴 최대 {tmax:.1f}µm, "
+              f"평균 {tmean:.1f}µm  (0~{args.adoc:.2f}mm, 무절삭 구간 영점)")
+    print("--- 참고: 아래(비절삭) 경계 반경차 — 정렬 진단용 ---")
     for tag, nf, wf, d, vb_max, vb_mean, u_lo, u_hi in report:
-        print(f"{tag}  새 {nf} vs 마모 {wf}(off{d:+d}):  후퇴 최대 {vb_max:.1f}µm, "
-              f"평균 {vb_mean:.1f}µm  (구간 {u_lo * um / 1000:.2f}~{u_hi * um / 1000:.2f}mm)")
+        print(f"{tag}  (off{d:+d})  최대 {vb_max:.1f}µm, 평균 {vb_mean:.1f}µm  "
+              f"(구간 {u_lo * um / 1000:.2f}~{u_hi * um / 1000:.2f}mm)")
     print(f"결과 저장: {out_dir}\\pair*_phasematch.png, pair*_retreat.png, "
           f"pair*_top_retreat.png, pair*_overlay.png")
 
