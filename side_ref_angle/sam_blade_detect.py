@@ -19,6 +19,7 @@ python sam_blade_detect.py "이미지경로" [--point X Y] [--model vit_h|mobile
                            [--out sam_blade_out] [--scale 0.35]
 """
 import argparse
+import os
 import sys
 import time
 from pathlib import Path
@@ -27,7 +28,29 @@ import cv2
 import numpy as np
 
 HERE = Path(__file__).resolve().parent
-SAM_DIR = HERE.parent / "tool_wear_v2" / "code" / "sam_models"
+
+# SAM 체크포인트(2.4GB)는 용량 때문에 저장소에 없다. 아래 위치를 순서대로 찾는다.
+#   1) 환경변수 SAM_MODELS_DIR 로 지정한 폴더
+#   2) 저장소 최상위의 sam_models/        ← 권장. 옆날·아랫날이 함께 쓴다
+#   3) tool_wear_v2/code/sam_models/      ← 옛 위치 (하위 호환)
+_SAM_CANDIDATES = [
+    Path(os.environ["SAM_MODELS_DIR"]) if os.environ.get("SAM_MODELS_DIR") else None,
+    HERE.parent / "sam_models",
+    HERE.parent / "tool_wear_v2" / "code" / "sam_models",
+]
+
+
+def sam_dir(ckpt_name=None):
+    """체크포인트 폴더를 찾아 반환. ckpt_name 을 주면 그 파일이 있는 폴더를 고른다."""
+    for d in _SAM_CANDIDATES:
+        if d is None:
+            continue
+        if (d / ckpt_name).exists() if ckpt_name else d.is_dir():
+            return d
+    return _SAM_CANDIDATES[1]          # 없으면 권장 위치를 반환(오류 메시지용)
+
+
+SAM_DIR = _SAM_CANDIDATES[1]
 MODELS = {
     "vit_h": ("vit_h", "sam_vit_h_4b8939.pth", "segment_anything"),
     "mobile": ("vit_t", "mobile_sam.pt", "mobile_sam"),
@@ -78,9 +101,13 @@ def get_predictor(model="vit_h"):
     import importlib
     import torch
     key, ckpt_name, pkg = MODELS[model]
-    ckpt = SAM_DIR / ckpt_name
+    ckpt = sam_dir(ckpt_name) / ckpt_name
     if not ckpt.exists():
-        raise FileNotFoundError(f"[SAM] 체크포인트 없음: {ckpt}")
+        tried = "\n  ".join(str(d / ckpt_name) for d in _SAM_CANDIDATES if d)
+        raise FileNotFoundError(
+            f"[SAM] 체크포인트 '{ckpt_name}' 를 찾지 못했습니다. 찾아본 위치:\n  {tried}\n"
+            f"  → 권장: 저장소 최상위에 sam_models/ 폴더를 만들고 그 안에 두세요. "
+            f"(환경변수 SAM_MODELS_DIR 로 다른 위치 지정 가능)")
     mod = importlib.import_module(pkg)
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     sam = mod.sam_model_registry[key](checkpoint=str(ckpt))

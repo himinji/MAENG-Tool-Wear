@@ -262,6 +262,7 @@ class MonitorApp:
         self.side_rescan_var = tk.BooleanVar(value=False)
         self.output_var = tk.StringVar(value=os.path.join(os.getcwd(), 'results_botface'))
         self.diam_var = tk.StringVar(value='8.0')
+        self.adoc_var = tk.StringVar(value='2.0')   # 옆날: 축방향 절삭깊이 mm
         self.stable_var = tk.StringVar(value='5')
         self.process_existing_var = tk.BooleanVar(value=True)
         self.status_var = tk.StringVar(value="대기 중")
@@ -312,12 +313,13 @@ class MonitorApp:
         self._field_row(s1, 1, "판별할(마모) 폴더", self.side_target_var, self._pick_side_target)
         self._field_row(s1, 2, "결과 폴더", self.output_var, self._pick_output)
         self._diam_row(s1, 3)
+        self._adoc_row(s1, 4)
         tk.Checkbutton(s1, text="레퍼런스 각도 스캔 다시 하기 (평소엔 기존 스캔 재사용)",
                        variable=self.side_rescan_var,
                        bg=self.CARD, fg=self.TEXT, activebackground=self.CARD,
                        activeforeground=self.TEXT, selectcolor='white',
                        font=('Malgun Gothic', 10), highlightthickness=0, bd=0
-                       ).grid(row=4, column=1, sticky='w', pady=(2, 0))
+                       ).grid(row=5, column=1, sticky='w', pady=(2, 0))
         ttk.Label(tab_side,
                   text="• 각 폴더의 Toolwear/옆(옆면 1° 회전 촬영, img_*.png)을 사용합니다. 옆 폴더를 직접 지정해도 됩니다.\n"
                        "• 처음 1회는 레퍼런스 각도 스캔(420장, 폴더당 수 분)이 자동 실행되고 이후 재사용됩니다.\n"
@@ -366,6 +368,16 @@ class MonitorApp:
         ttk.Label(parent, text="공구 직경 (mm)", style='Field.TLabel').grid(row=row, column=0, sticky='w', pady=5, padx=(0, 12))
         ttk.Spinbox(parent, from_=0.5, to=50.0, increment=0.5, textvariable=self.diam_var, width=8,
                     style='Modern.TSpinbox').grid(row=row, column=1, sticky='w', pady=5)
+
+    def _adoc_row(self, parent, row):
+        """축방향 절삭깊이(ADOC). 마모 측정 구간(0~ADOC)과 영점 구간(ADOC~)을 가른다."""
+        ttk.Label(parent, text="절삭 깊이 ADOC (mm)", style='Field.TLabel').grid(
+            row=row, column=0, sticky='w', pady=5, padx=(0, 12))
+        f = ttk.Frame(parent); f.grid(row=row, column=1, sticky='w', pady=5)
+        ttk.Spinbox(f, from_=0.1, to=50.0, increment=0.5, textvariable=self.adoc_var, width=8,
+                    style='Modern.TSpinbox').pack(side='left')
+        ttk.Label(f, text="  가공할 때 축방향으로 파고든 깊이. 이 안쪽만 마모로 집계합니다.",
+                  style='Hint.TLabel').pack(side='left')
 
     def _set_status(self, text, color):
         self.status_lbl.configure(text="●  " + text, fg=color)
@@ -559,8 +571,15 @@ class MonitorApp:
         except ValueError:
             messagebox.showerror("오류", "공구 직경(mm)은 양수여야 합니다.")
             return
+        try:
+            adoc = float(self.adoc_var.get())
+            if adoc <= 0:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror("오류", "절삭 깊이 ADOC(mm)은 양수여야 합니다.")
+            return
         p = {'ref': ref, 'target': target, 'output': output, 'diam': diam,
-             'rescan': self.side_rescan_var.get()}
+             'adoc': adoc, 'rescan': self.side_rescan_var.get()}
         self._launch(self._side_oneshot, p, allow_stop=True, status="옆날 판별 중")
 
     def _busy(self):
@@ -730,7 +749,9 @@ class MonitorApp:
                                    '--new-dir', side_folder(p['ref']),
                                    '--worn-dir', side_folder(p['target']),
                                    '--new-csv', new_csv, '--worn-csv', worn_csv,
-                                   '--diam', str(p['diam']), '--tip-skip', '210',
+                                   '--diam', str(p['diam']),
+                                   '--adoc', str(p.get('adoc', 2.0)),
+                                   '--tip-skip', '210',
                                    '--out', out_dir], cwd=SIDE_DIR)
             if rc == 0:
                 self.log(f"\n[{name}] 옆날 판별 완료 ▶ 결과 폴더: {out_dir}")
@@ -784,7 +805,8 @@ class MonitorApp:
                'diag_ref': self.diag_ref_var.get(), 'diag_target': self.diag_target_var.get(),
                'side_ref': self.side_ref_var.get(), 'side_target': self.side_target_var.get(),
                'output': self.output_var.get(),
-               'diam': self.diam_var.get(), 'stable': self.stable_var.get(),
+               'diam': self.diam_var.get(), 'adoc': self.adoc_var.get(),
+               'stable': self.stable_var.get(),
                'process_existing': self.process_existing_var.get()}
         try:
             with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
@@ -807,6 +829,7 @@ class MonitorApp:
         self.side_target_var.set(cfg.get('side_target', ''))
         self.output_var.set(cfg.get('output', self.output_var.get()))
         self.diam_var.set(cfg.get('diam', '8.0'))
+        self.adoc_var.set(cfg.get('adoc', '2.0'))
         self.stable_var.set(cfg.get('stable', '5'))
         self.process_existing_var.set(cfg.get('process_existing', True))
 
