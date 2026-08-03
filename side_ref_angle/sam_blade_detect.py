@@ -180,10 +180,12 @@ def detect_blade(gray, point=None, predictor=None, thresh=210, tip_radius=60,
         sub = base[y0:y1, x0:x1]
         sys_, sxs = np.nonzero(sub)
         if len(sxs) >= 3:
-            pts = np.vstack([np.column_stack([sxs, sys_]),
-                             [[tip[0] - x0, tip[1] - y0]]]).astype(np.int32)
+            # 변수명 주의: pts 는 위에서 SAM 프롬프트로 쓰고 반환하는 값이라
+            # 여기서 재사용하면 안 된다 (반환된 points 가 껍질 좌표로 덮임)
+            hull_pts = np.vstack([np.column_stack([sxs, sys_]),
+                                  [[tip[0] - x0, tip[1] - y0]]]).astype(np.int32)
             hullm = np.zeros(sub.shape, np.uint8)
-            cv2.fillConvexPoly(hullm, cv2.convexHull(pts), 1)
+            cv2.fillConvexPoly(hullm, cv2.convexHull(hull_pts), 1)
             hullm = cv2.dilate(hullm, np.ones((5, 5), np.uint8))
             ok = np.zeros((h, w), bool)
             ok[y0:y1, x0:x1] = hullm.astype(bool)
