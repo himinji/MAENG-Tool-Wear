@@ -26,9 +26,11 @@ python find_ref_angle.py "G:\\내 드라이브\\...\\옆" [--thresh 210] [--x-to
 """
 import argparse
 import csv
+import os
 import re
 import sys
 import time
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 import cv2
@@ -107,6 +109,14 @@ def measure(img: np.ndarray, thresh: int, x_tol: int):
             "valid": 1, "reason": ""}
 
 
+def _scan_one(task):
+    """이미지 1장 측정 (프로세스 풀 워커). task=(index, path, thresh, x_tol)."""
+    i, path, thresh, x_tol = task
+    img = imread_gray(Path(path))
+    m = {**INVALID, "reason": "읽기 실패"} if img is None else measure(img, thresh, x_tol)
+    return {"index": i, "file": Path(path).name, **m}
+
+
 def annotate(img, m, out_path: Path):
     vis = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
     h, w = img.shape
@@ -128,6 +138,10 @@ def main():
     ap.add_argument("--x-tol", type=int, default=20, help="최좌단에서 y 극값 경쟁에 참여시킬 x 허용 오차(px, 기본 20)")
     ap.add_argument("--min-sep", type=int, default=90, help="1·2위 피크 사이 최소 인덱스 간격 (기본 90)")
     ap.add_argument("--out", default="ref_angle_out", help="결과 저장 폴더 (기본 ./ref_angle_out)")
+    ap.add_argument("--jobs", type=int, default=0,
+                    help="병렬 프로세스 수 (기본 0 = CPU 코어 수 - 1). "
+                         "이미지끼리 독립이라 결과는 순차 처리와 동일하다. "
+                         "1 이면 병렬 없이 순차 처리")
     args = ap.parse_args()
 
     try:
@@ -143,20 +157,33 @@ def main():
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"{len(files)}장 처리 시작 (thresh={args.thresh}, x우선, x_tol={args.x_tol})")
+    nproc = args.jobs if args.jobs > 0 else max(1, (os.cpu_count() or 2) - 1)
+    nproc = min(nproc, len(files))
+    print(f"{len(files)}장 처리 시작 (thresh={args.thresh}, x우선, "
+          f"x_tol={args.x_tol}, 프로세스 {nproc}개)")
     t0 = time.time()
-    rows = []
-    for i, p in enumerate(files):
-        img = imread_gray(p)
-        if img is None:
-            m = {**INVALID, "reason": "읽기 실패"}
-        else:
-            m = measure(img, args.thresh, args.x_tol)
-        rows.append({"index": i, "file": p.name, **m})
-        if (i + 1) % 40 == 0 or i == len(files) - 1:
-            el = time.time() - t0
-            eta = el / (i + 1) * (len(files) - i - 1)
-            print(f"  {i + 1}/{len(files)}  경과 {el:5.1f}s  남은시간 약 {eta:4.0f}s")
+    rows = [None] * len(files)
+
+    if nproc <= 1:
+        for i, p in enumerate(files):
+            rows[i] = _scan_one((i, str(p), args.thresh, args.x_tol))
+            if (i + 1) % 40 == 0 or i == len(files) - 1:
+                el = time.time() - t0
+                eta = el / (i + 1) * (len(files) - i - 1)
+                print(f"  {i + 1}/{len(files)}  경과 {el:5.1f}s  남은시간 약 {eta:4.0f}s")
+    else:
+        # 이미지끼리 독립이므로 프로세스 풀로 나눠 처리한다. 결과는 index 로
+        # 제자리에 넣어 순서를 보장 → 단일 프로세스와 완전히 같은 결과.
+        tasks = [(i, str(p), args.thresh, args.x_tol) for i, p in enumerate(files)]
+        done = 0
+        with ProcessPoolExecutor(max_workers=nproc) as ex:
+            for r in ex.map(_scan_one, tasks, chunksize=8):
+                rows[r["index"]] = r
+                done += 1
+                if done % 40 == 0 or done == len(files):
+                    el = time.time() - t0
+                    eta = el / done * (len(files) - done)
+                    print(f"  {done}/{len(files)}  경과 {el:5.1f}s  남은시간 약 {eta:4.0f}s")
 
     y_diffs = np.array([r["y_diff"] for r in rows])
     valid = np.array([r["valid"] for r in rows], dtype=bool)
