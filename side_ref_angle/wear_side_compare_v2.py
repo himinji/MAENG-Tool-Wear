@@ -637,6 +637,10 @@ def top_retreat_align(n, wn, s, um, adoc_mm, base_lo_mm=2.5, base_hi_mm=3.9,
     tw_y = wt[np.searchsorted(uw_s, c)]
     raw = (tw_y - tn_y) * um
     ge = int(c.max()) - 100                       # 마스크 끝 아티팩트 제외
+    # 영점: 무절삭 구간 차이의 중앙값(상수)을 뺀다.
+    # (1차 직선 맞춤도 시험했으나 폐기 — 무절삭 구간 곡선이 직선이 아니라
+    #  기울기가 요동치고, 그걸 절삭 구간으로 외삽하면 오차가 증폭된다.
+    #  두 날의 기울기가 부호까지 갈렸고 평균 후퇴가 음수로 붕괴했다.)
     bz = (c >= adoc_mm * 1000.0 / um) & (c <= ge)
     bias = float(np.median(raw[bz])) if bz.any() else 0.0
     raw = raw - bias
@@ -751,7 +755,7 @@ def main():
     ap.add_argument("--thresh", type=int, default=210)
     ap.add_argument("--tip-trim", action="store_true",
                     help="연한 날끝 트림: 반지름 30px 원을 날끝→클릭 방향으로 밀며 "
-                         "원 안 실루엣의 진한 비율이 80% 미만인 동안 연한 픽셀을 "
+                         "원 안 실루엣의 진한 비율이 80%% 미만인 동안 연한 픽셀을 "
                          "제외 (기본 꺼짐)")
     ap.add_argument("--tip-trim-level", type=float, default=0.32,
                     help="트림의 '진한' 기준 = 몸통에서 배경 쪽으로 이 비율만큼 간 "
@@ -762,6 +766,11 @@ def main():
                          "날끝에서 이어진 연한 픽셀이 200개 이상인 프레임만 그 "
                          "무게중심에 음성점을 추가하고 날끝 패치를 생략 → 확실히 "
                          "진한 재료만 마스킹(A안). 새 공구는 항상 날끝까지 잡음")
+    ap.add_argument("--crop-right", type=float, default=1.0,
+                    help="SAM 크롭의 오른쪽 폭 = 반경 R 의 몇 배인가 (기본 1.0). "
+                         "2.0 이면 직경만큼(8mm 공구에서 8mm). 세로를 안 자르므로 "
+                         "폭이 높이(2076px)를 넘지 않는 한 해상도 손실이 없고, "
+                         "영점(무절삭) 구간이 넓어져 기준선이 안정된다")
     ap.add_argument("--sam-crop", choices=["on", "off"], default="on",
                     help="SAM 을 고정 좌표 크롭 위에서 실행 (기본 on). "
                          "창 = x∈[ref_x−R/2, ref_x+R] — ref_x는 새 공구 "
@@ -832,21 +841,32 @@ def main():
     print(f"스케일: {um:.3f} µm/px  (직경 {args.diam}mm / 새 공구 피크 y_diff {sel['new']['ref_ydiff']:.0f}px)")
 
     # SAM 크롭 창(고정 좌표): 새 공구 레퍼런스(피크 2장)의 날끝 x 를 기준으로
-    # [ref_x−R/2, ref_x+R] 을 한 번 정하고, 모든 사진(새·마모)을 같은 좌표로 자른다.
-    # R = 새 공구 반경(px) = 피크 y_diff / 2.
+    # [ref_x−R/2, ref_x + crop_right×R] 을 한 번 정하고, 모든 사진(새·마모)을
+    # 같은 좌표로 자른다. R = 새 공구 반경(px) = 피크 y_diff / 2.
+    # 세로를 자르지 않으므로 SAM 축소율은 높이(긴 변)가 정하고, 폭을 높이까지
+    # 넓혀도 해상도 손실이 없다. crop_right 2.0 이면 오른쪽이 직경만큼(8mm).
     sam_win = None
     if args.sam_crop == "on":
         R = int(round(sel["new"]["ref_ydiff"] / 2.0))
-        ref_tips = []
+        ref_tips, img_w = [], None
         for pk in sel["new"]["peaks"]:
             g = imread_gray(Path(args.new_dir) / sel["new"]["files"][pk])
+            img_w = g.shape[1]
             _, tp = tool_silhouette(g, args.thresh)
             ref_tips.append(tp[0])
         ref_x = int(round(np.mean(ref_tips)))
-        sam_win = (max(ref_x - R // 2, 0), ref_x + R)
+        x1 = ref_x + int(round(args.crop_right * R))
+        sam_win = (max(ref_x - R // 2, 0), x1)
         print(f"SAM 크롭(고정 좌표): 새 공구 레퍼런스 날끝 x={ref_x} "
               f"(피크 2장 {ref_tips}) → x {sam_win[0]}~{sam_win[1]} "
-              f"(R={R}px, 세로는 전체 유지)")
+              f"(R={R}px, 오른쪽 {args.crop_right:g}R={args.crop_right * R * um / 1000:.2f}mm, "
+              f"세로는 전체 유지)")
+        if img_w and x1 > img_w:
+            print(f"  [경고] 크롭 오른쪽 끝 {x1}px 이 이미지 폭 {img_w}px 을 "
+                  f"{x1 - img_w}px 넘어섭니다 → 실제로는 잘려서 세션마다 창 폭이 "
+                  f"달라질 수 있습니다. --crop-right 를 줄이세요")
+        elif img_w:
+            print(f"  이미지 오른쪽 여유 {img_w - x1}px")
 
     # 위상 선택용 RMSE 계산 범위 — 날끝~crop_factor×adoc 으로 크롭
     if args.crop_factor > 0:
