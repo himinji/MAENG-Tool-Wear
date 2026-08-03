@@ -534,9 +534,12 @@ def process_frame(folder, files, idx, predictor, thresh, side, sam_win=None,
     except Exception as e:
         print(f"    [건너뜀] idx {idx} {files[idx]}: {e}")
         return None
-    # 스냅된 에지로 마스크 경계를 갱신 → 마스크와 측정 에지가 하나로 통합
-    us, ys = snapped_series(gray, det["final"], det["tip"], sd)
-    det["final"] = refine_mask(det["final"], det["tip"], sd, us, ys)
+    # 스냅된 에지로 마스크 경계를 갱신 → 마스크와 측정 에지가 하나로 통합.
+    # 스냅은 항상 '아래 경계' 고정 — 위 경계는 공구 내부 경계라 대비가 없고,
+    # 대비가 생기는 유일한 경우가 반대날 정반사라 오검출만 만든다.
+    # side 는 '어느 날을 잡을지'만 정하고 '어느 경계를 스냅할지'는 안 바꾼다.
+    us, ys = snapped_series(gray, det["final"], det["tip"], "bottom")
+    det["final"] = refine_mask(det["final"], det["tip"], "bottom", us, ys)
     r = np.abs(ys - axis_y)
     return {"gray": gray, "det": det, "tip": det["tip"], "axis": axis_y,
             "body_h": body_h, "jig_h": jig_height(gray),
@@ -732,7 +735,8 @@ def main():
     ap.add_argument("--swap", action="store_true",
                     help="(구버전 호환) --pairing swap 과 동일")
     ap.add_argument("--side", choices=["bottom", "top"], default="bottom",
-                    help="측정할 절삭날 쪽 (기본 bottom)")
+                    help="SAM 이 잡을 날이 회전축의 어느 쪽인가 (기본 bottom). "
+                         "스냅 경계와는 무관 — 스냅은 항상 아래 경계 고정")
     ap.add_argument("--search", type=int, default=3,
                     help="마모공구 위상 탐색 반경(프레임, 기본 3 = 총 7장)")
     ap.add_argument("--rmse-edge", choices=["bottom", "top", "both"], default="both",
