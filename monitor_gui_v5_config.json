@@ -2,10 +2,11 @@
   "parent": "",
   "diag_ref": "G:/내 드라이브/02_Big Data/01_Milling/260704_SM45C/Initial",
   "diag_target": "G:/내 드라이브/02_Big Data/01_Milling/260709_SM45C/Test44",
-  "side_ref": "G:/내 드라이브/02_Big Data/01_Milling/260728_SM45C_ALUCUT_test_4000_1.5/Initial",
-  "side_target": "G:/내 드라이브/02_Big Data/01_Milling/260728_SM45C_ALUCUT_test_4000_1.5/Test10",
+  "side_ref": "G:/내 드라이브/02_Big Data/01_Milling/260704_SM45C/Initial",
+  "side_target": "G:/내 드라이브/02_Big Data/01_Milling/260704_SM45C/Test25/Toolwear",
   "output": "C:/MAENG-Tool-Wear/side_ref_angle",
   "diam": "8.0",
+  "adoc": "1.5",
   "stable": "5",
   "process_existing": true
 }
