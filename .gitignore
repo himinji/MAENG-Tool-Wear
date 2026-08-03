@@ -38,8 +38,11 @@ tool_wear_v2/_*/
 results_botface/
 results_Al/
 # SAM 모델 체크포인트 (대용량, 재다운로드 가능)
+# vit_h 는 2.4GB 라 GitHub 100MB 제한을 넘는다. 저장소에 넣지 말고 별도 배포할 것.
+sam_models/
 tool_wear_v2/code/sam_models/
 tool_wear_v2/sam_models/
+*.pth
 # side ref-angle test outputs
 ref_angle_out*/
 sam_click_out*/
